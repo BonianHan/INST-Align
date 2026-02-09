@@ -1,0 +1,47 @@
+# Data (large h5ad files)
+Data/
+Data.zip
+Data.zip:Zone.Identifier
+*.h5ad
+
+# Results & outputs
+Results/
+result_metrics/
+*.output
+benchmark_results.csv
+benchmark_summary.csv
+benchmark_results.png
+expr_comparison_results.csv
+expr_comparison_summary.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Notebooks (exploratory, not part of core package)
+*.ipynb
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# IDE
+.vscode/
+.idea/
+
+# Claude project config
+.claude/
+
+# Environment
+.env
+*.log

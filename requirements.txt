@@ -1,0 +1,26 @@
+# Core dependencies
+torch>=1.13
+numpy>=1.22,<2.0
+scipy>=1.9
+scikit-learn>=1.0
+
+# Spatial transcriptomics
+anndata>=0.8
+scanpy>=1.9
+pandas>=1.5
+
+# Optimal transport
+POT>=0.9  # python optimal transport (import ot)
+
+# Visualization
+matplotlib>=3.5
+seaborn>=0.12
+
+# Baselines (optional — benchmark only)
+paste-bio>=1.4        # PASTE alignment
+spateo-release>=0.0.1 # Spateo alignment (install from source: https://github.com/aristoteleo/spateo-release)
+SPACEL>=1.1           # SPACEL Scube alignment
+STalign>=1.0          # STalign diffeomorphic alignment (pip install git+https://github.com/JEFworks-Lab/STalign.git)
+
+# Utilities
+numba>=0.56
