@@ -1,8 +1,8 @@
-# INR-Align
+# INR-Align gross draft code & abstract
 
-Spatial transcriptomics slice alignment via implicit neural representations (INR).
+Title: INST-Align: Implicit Neural Alignment for Spatial Transcriptomics via Canonical Expression FieldsSpatial transcriptomics slice alignment via implicit neural representations (INR).
 
-INR-Align combines ICP rigid alignment with a Nerfies-style deformation network and a canonical expression field (ExprField) for joint nonrigid alignment and batch correction of spatial transcriptomics data.
+Abstract: Spatial Transcriptomics (ST) enables the study of gene expression within a structural context, yet aligning multiple slices into a coherent 3D volume is mathematically ill-posed due to complex non-rigid distortions and signal sparsity. In this paper, we introduce INST-Align, a novel framework that leverages Implicit Neural Fields to model the continuous mapping between observed ST slices and a shared Canonical Expression Field. Unlike traditional discrete registration, INST-Align parameterizes deformation as a continuous coordinate-based neural network, effectively addressing the ill-posed nature of alignment. Crucially, our Canonical Expression Field serves as a unified reference that enables the simultaneous integration of multi-slice data to remove technical batch effects. This unified framework establishes a mutually reinforcing optimization process: precise spatial alignment facilitates accurate expression integration, which in turn guides more robust registration coordinates. Extensive experiments on multi-slice ST datasets demonstrate that INST-Align achieves superior registration precision and batch correction performance compared to existing state-of-the-art methods.
 
 ---
 
