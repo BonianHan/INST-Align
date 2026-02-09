@@ -300,18 +300,6 @@ aligned, metrics = run(config)
 
 ---
 
-## Citation
-
-If you use INR-Align in your research, please cite:
-
-```bibtex
-@inproceedings{inr-align2026,
-  title={INR-Align: Spatial Transcriptomics Alignment via Implicit Neural Representations},
-  author={},
-  booktitle={MICCAI},
-  year={2026}
-}
-```
 
 ## License
 
