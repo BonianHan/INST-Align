@@ -347,12 +347,25 @@ def run_ours(
     matcher = UnifiedCostMatcher(config.matcher)
 
     # ExprField (canonical consistency)
-    expr_field_model = pretrained_expr_field.model if pretrained_expr_field is not None else None
+    expr_field_model = None
+    expr2_canon = None
+    if pretrained_expr_field is not None and config.use_expr_field:
+        expr_field_model = pretrained_expr_field.model
+        # Prepare source expression for canonical loss
+        top_idx = pretrained_expr_field.gene_indices
+        norm_stats = pretrained_expr_field.norm_stats
+        hvg_mask = slice2.var["highly_variable"].values
+        expr2_raw = slice2[:, hvg_mask].X
+        if scipy.sparse.issparse(expr2_raw):
+            expr2_raw = expr2_raw.toarray()
+        expr2_sub = torch.tensor(expr2_raw[:, top_idx].astype(np.float32), device=device)
+        expr2_canon, _ = normalize_expression(expr2_sub, config.expr_field.norm_method, stats=norm_stats)
 
     result = train(
         model, matcher, x1, emb1, x2, emb2, config.train,
         expr_field=expr_field_model,
         lam_canonical=config.expr_field.lam_canonical if config.use_expr_field else 0.0,
+        expr2_canon=expr2_canon,
     )
 
     # Apply

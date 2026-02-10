@@ -49,6 +49,7 @@ def train(
     # --- ExprField (canonical consistency) ---
     expr_field: Optional[nn.Module] = None,
     lam_canonical: float = 0.0,
+    expr2_canon: Optional[torch.Tensor] = None,
     # --- Expression INR (legacy, optional) ---
     expr_inr: Optional[nn.Module] = None,
     expr2_hvg: Optional[torch.Tensor] = None,
@@ -66,10 +67,11 @@ def train(
         emb2: ``(N2, D)`` source PCA embeddings (on device).
         config: Training hyper-parameters.
         expr_field: Pre-trained ``ExprField`` (optional).  When provided
-            with ``lam_canonical > 0``, a canonical consistency loss is
-            added after warmup.  Backbone is frozen; only batch_emb may
-            be trainable.
+            with ``lam_canonical > 0``, canonical consistency loss is added.
+            Backbone is unfrozen and fine-tuned with lower LR.
         lam_canonical: Weight for canonical consistency loss.
+        expr2_canon: ``(N2, G)`` source HVG expression (normalized, on device).
+            Required when ``expr_field`` is provided.
         expr_inr: Pre-trained ``ExpressionINR`` (legacy, optional).
         expr2_hvg: ``(N2, G)`` source HVG expression (normalized, on device).
         lam_recon: Weight for the expression reconstruction loss.
@@ -89,19 +91,8 @@ def train(
     emb1_norm = F.normalize(emb1, dim=1)
     emb2_norm = F.normalize(emb2, dim=1)
 
-    # --- ExprField setup (freeze backbone, keep batch_emb trainable) ---
-    use_canonical = (expr_field is not None and lam_canonical > 0)
-    if use_canonical:
-        # Freeze encoder + backbone + bottleneck + head
-        for param in expr_field.encoder.parameters():
-            param.requires_grad = False
-        for param in expr_field.backbone.parameters():
-            param.requires_grad = False
-        for param in expr_field.bottleneck.parameters():
-            param.requires_grad = False
-        for param in expr_field.head.parameters():
-            param.requires_grad = False
-        # batch_emb stays trainable (default)
+    # --- ExprField setup (unfrozen, fine-tuned with lower LR) ---
+    use_canonical = (expr_field is not None and lam_canonical > 0 and expr2_canon is not None)
 
     # --- Expression INR setup (legacy) ---
     use_recon = (expr_inr is not None and expr2_hvg is not None and lam_recon > 0)
@@ -116,10 +107,10 @@ def train(
             "lr": config.lr * finetune_lr_factor,
         })
     if use_canonical:
-        # Only batch_emb is trainable in ExprField
+        # Fine-tune entire ExprField with lower LR
         param_groups.append({
-            "params": expr_field.batch_emb.parameters(),
-            "lr": config.lr * 0.01,
+            "params": expr_field.parameters(),
+            "lr": config.lr * 0.1,
         })
     optimizer = torch.optim.Adam(param_groups)
 
@@ -206,7 +197,7 @@ def train(
             if use_canonical:
                 ramp = min(ep / max(warmup, 1), 1.0)  # 0→1 during warmup, 1.0 after
                 canon_weight = lam_canonical * ramp
-                L_canon = canonical_consistency_loss(expr_field, x2_def, target_fwd)
+                L_canon = canonical_consistency_loss(expr_field, x2_def, expr2_canon[idx])
                 loss = loss + canon_weight * L_canon
                 L_canon_val = L_canon.item()
 

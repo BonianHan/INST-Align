@@ -281,28 +281,30 @@ def compute_bidirectional_loss(
 def canonical_consistency_loss(
     expr_field: nn.Module,
     x2_def: torch.Tensor,
-    x1_matched: torch.Tensor,
+    expr2_gt: torch.Tensor,
 ) -> torch.Tensor:
-    """Canonical consistency loss for joint alignment + batch correction.
+    """Canonical consistency loss: deformed coords should predict source expression.
 
-    Compares the canonical (batch-free) expression predictions at deformed
-    source coordinates vs. their matched reference coordinates.  Gradients
-    flow through ``x2_def`` back to the ``DeformationNet``.
+    The ExprField learns a canonical expression field from all slices jointly.
+    This loss says: if a source cell with expression ``expr2_gt`` is deformed
+    to position ``x2_def``, the canonical field at that position should match
+    the cell's actual expression.  This provides an alignment signal that is
+    independent of the soft-matching — it uses the cell's own expression as
+    ground truth.
+
+    Gradients flow through both ``x2_def`` (to the DeformationNet) and
+    through the ExprField (unfrozen backbone adapts to deformed geometry).
 
     Args:
-        expr_field: Trained ``ExprField`` with frozen backbone.
+        expr_field: ``ExprField`` (backbone trainable during deformation).
         x2_def: ``(B, 2)`` deformed source coordinates (with grad).
-        x1_matched: ``(B, 2)`` soft-matched reference coordinates
-            (detached, from ``target_fwd``).
+        expr2_gt: ``(B, G)`` ground-truth source HVG expression (normalized).
 
     Returns:
         Scalar MSE loss.
     """
-    # Source side: canonical prediction at deformed coords (gradients flow to DeformNet)
-    expr_src = expr_field.canonical(x2_def)
-    # Reference side: canonical prediction at matched coords (no gradients)
-    expr_ref = expr_field.canonical(x1_matched.detach())
-    return F.mse_loss(expr_src, expr_ref.detach())
+    expr_pred = expr_field.canonical(x2_def)
+    return F.mse_loss(expr_pred, expr2_gt.detach())
 
 
 # ============================================================================
