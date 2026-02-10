@@ -39,8 +39,8 @@ class MatcherConfig:
     """Adaptive-temperature soft matcher."""
 
     tau_init: float = 0.1
-    tau_min: float = 0.01
-    tau_max: float = 0.5
+    tau_min: float = 0.05
+    tau_max: float = 1.0
     lambda_feat: float = 1.0
     ema_decay: float = 0.9
     sinkhorn_iters: int = 0  # 0 = softmax (default), >0 = Sinkhorn normalization iterations
@@ -60,11 +60,13 @@ class TrainConfig:
     lr: float = 1e-3
     weight_rev: float = 1.0
     lam_jacobian: float = 0.015
-    jacobian_samples: int = 256
-    grad_clip: float = 2.0
+    jacobian_samples: int = 512
+    lam_repulsion: float = 0.0     # anti-collapse repulsion loss weight (0 = off)
+    repulsion_pairs: int = 512     # number of random pairs for repulsion loss
+    grad_clip: float = 1.0
     warmup_fraction: float = 0.3
     print_every: int = 10
-    scheduler_patience: int = 30   # ReduceLROnPlateau: epochs without improvement before LR drop
+    scheduler_patience: int = 50   # ReduceLROnPlateau: epochs without improvement before LR drop
     scheduler_factor: float = 0.5  # LR multiplied by this factor on plateau
     scheduler_min_lr: float = 1e-6 # minimum LR floor
 

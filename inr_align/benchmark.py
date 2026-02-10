@@ -173,28 +173,46 @@ def run_spacel_baseline(
 ) -> Tuple[float, float, float, float]:
     """SPACEL Scube.align (graph-based alignment).
 
+    Runs in a separate ``spacel`` conda environment via subprocess,
+    because SPACEL requires ``torch<=1.13`` which is incompatible with
+    the main environment.
+
     Returns:
         ``(acc_ot, acc_nn, ratio, elapsed_time)``.
     """
-    from SPACEL import Scube
+    import os
+    import subprocess
+    import tempfile
 
-    s1 = slice1.copy()
-    s2 = slice2.copy()
+    # Save slices to temp files
+    with tempfile.TemporaryDirectory() as tmpdir:
+        s1_path = os.path.join(tmpdir, "s1.h5ad")
+        s2_path = os.path.join(tmpdir, "s2.h5ad")
+        out_path = os.path.join(tmpdir, "result.npz")
 
-    # SPACEL needs cluster labels — use label_key as the cluster key
-    cluster_key = label_key
+        slice1.write_h5ad(s1_path)
+        slice2.write_h5ad(s2_path)
 
-    start = time.time()
-    Scube.align([s1, s2], cluster_key=cluster_key, n_neighbors=15, n_threads=10, p=2)
-    elapsed = time.time() - start
+        # Find spacel_runner.py relative to this file
+        runner = os.path.join(os.path.dirname(os.path.dirname(__file__)), "spacel_runner.py")
 
-    # Extract aligned coordinates
-    coords1 = s1.obsm["spatial_aligned"]
-    coords2 = s2.obsm["spatial_aligned"]
-    if hasattr(coords1, "to_numpy"):
-        coords1 = coords1.to_numpy()
-    if hasattr(coords2, "to_numpy"):
-        coords2 = coords2.to_numpy()
+        cmd = [
+            "conda", "run", "-n", "spacel", "--no-capture-output",
+            "python", runner,
+            "--slice1", s1_path,
+            "--slice2", s2_path,
+            "--label_key", label_key,
+            "--output", out_path,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"SPACEL subprocess failed:\n{result.stderr}")
+
+        data = np.load(out_path)
+        coords1 = data["coords1"]
+        coords2 = data["coords2"]
+        elapsed = float(data["elapsed"])
 
     pi = coords_to_pi(coords1, coords2)
 

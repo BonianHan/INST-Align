@@ -165,6 +165,56 @@ def jacobian_reg(
 
 
 # ============================================================================
+# Repulsion loss (anti-collapse)
+# ============================================================================
+
+
+def repulsion_loss(
+    x_before: torch.Tensor,
+    x_after: torch.Tensor,
+    n_pairs: int = 512,
+) -> torch.Tensor:
+    """Penalize pairwise distance shrinkage to prevent many-to-one collapse.
+
+    Randomly samples point pairs and penalizes cases where the post-deformation
+    distance is smaller than the pre-deformation distance.  This provides a
+    global anti-collapse signal that complements local Jacobian regularization.
+
+    The loss is: ``mean(ReLU(d_before² - d_after²) / (d_before² + eps))``
+    — normalized by original distance so that nearby and far pairs are
+    treated equally.
+
+    Args:
+        x_before: ``(N, 2)`` coordinates before deformation.
+        x_after: ``(N, 2)`` coordinates after deformation.
+        n_pairs: Number of random point pairs to sample.
+
+    Returns:
+        Scalar loss (0 if no shrinkage occurs).
+    """
+    N = x_before.shape[0]
+    n_pairs = min(n_pairs, N * (N - 1) // 2)
+
+    # Random pair indices
+    idx_a = torch.randint(0, N, (n_pairs,), device=x_before.device)
+    idx_b = torch.randint(0, N, (n_pairs,), device=x_before.device)
+    # Avoid self-pairs
+    mask = idx_a != idx_b
+    idx_a, idx_b = idx_a[mask], idx_b[mask]
+    if idx_a.shape[0] == 0:
+        return torch.tensor(0.0, device=x_before.device)
+
+    d_before_sq = (x_before[idx_a] - x_before[idx_b]).pow(2).sum(dim=1)
+    d_after_sq = (x_after[idx_a] - x_after[idx_b]).pow(2).sum(dim=1)
+
+    # Only penalize shrinkage (d_after < d_before)
+    shrinkage = F.relu(d_before_sq - d_after_sq)
+    # Normalize by original distance to treat all scales equally
+    loss = (shrinkage / (d_before_sq + 1e-8)).mean()
+    return loss
+
+
+# ============================================================================
 # Matching losses (convenience wrappers)
 # ============================================================================
 

@@ -98,7 +98,16 @@ def _config_for_dataset(config: PipelineConfig, dataset: str) -> PipelineConfig:
         cfg.train.lam_jacobian = overrides["lam_jacobian"]
     if "warmup_fraction" in overrides:
         cfg.train.warmup_fraction = overrides["warmup_fraction"]
-    print(f"  [dataset override] {dataset}: lam_jacobian={cfg.train.lam_jacobian}, warmup={cfg.train.warmup_fraction}")
+    if "topk" in overrides:
+        cfg.train.topk = overrides["topk"]
+    if "batch_size" in overrides:
+        cfg.train.batch_size = overrides["batch_size"]
+    parts = [f"lam_jac={cfg.train.lam_jacobian}", f"warmup={cfg.train.warmup_fraction}"]
+    if "topk" in overrides:
+        parts.append(f"topk={cfg.train.topk}")
+    if "batch_size" in overrides:
+        parts.append(f"bs={cfg.train.batch_size}")
+    print(f"  [dataset override] {dataset}: {', '.join(parts)}")
     return cfg
 
 

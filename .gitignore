@@ -29,6 +29,7 @@ build/
 
 # Notebooks (exploratory, not part of core package)
 *.ipynb
+!visual_nonrigid.ipynb
 
 # OS files
 .DS_Store
@@ -45,3 +46,6 @@ nul
 # Environment
 .env
 *.log
+
+# Dev log (local only)
+log.txt

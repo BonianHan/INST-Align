@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from inr_align.config import TrainConfig
-from inr_align.loss import canonical_consistency_loss, compute_P_matrix, expression_reconstruction_loss, jacobian_reg
+from inr_align.loss import canonical_consistency_loss, compute_P_matrix, expression_reconstruction_loss, jacobian_reg, repulsion_loss
 from inr_align.model import DeformationNet, UnifiedCostMatcher
 
 
@@ -188,6 +188,11 @@ def train(
                 loss = L_match + config.lam_jacobian * L_jac
             else:
                 loss = L_match
+
+            # Repulsion loss (anti-collapse)
+            if config.lam_repulsion > 0:
+                L_rep = repulsion_loss(x2_batch.detach(), x2_def, n_pairs=config.repulsion_pairs)
+                loss = loss + config.lam_repulsion * L_rep
 
             # Expression reconstruction loss (legacy, only after warmup)
             L_recon_val = 0.0
