@@ -120,7 +120,72 @@
 6. **ExprField frozen+target_fwd 最有效** — 虽然理论上有闭环问题，但实际起到了正则化效果
 7. **ExprField unfrozen+source_GT** — canon loss 数值太大（受限于 ExprField 拟合能力），需要更精细的权重平衡
 
+### Round 9: ExprField 自重建 — frozen encoder vs unfrozen encoder (2026-02-11)
+
+**改动**: Stage 2 不再用 matched target expression，改为 self-reconstruction:
+  - Loss = MSE(ExprField(x2_def, slice_id=src), expr2_src)
+  - 每个 source cell 重建自己的 expression
+  - match_decay: 线性衰减 matching loss weight (1.0 → 0.1)
+
+**实验A — frozen encoder (backbone+bottleneck frozen, 只训练 FiLM+head)**:
+  - DLPFC sample0 (3 pairs): Mean OT ≈ 0.597 (baseline 0.604)
+  - R² pretrain: 0.089 (200 genes), 0.036 (2000 genes) — very low on grid data
+  - recon loss ~0.90-0.93，几乎不下降，梯度噪声太大
+
+**实验B — unfrozen encoder (整个 ExprField 与 DeformNet 一起训练)**:
+  - DLPFC 全部 9 pairs (3 samples × 3 pairs):
+
+| Method | OT Acc (9p) | NN Acc (9p) | Ratio (9p) |
+|--------|-------------|-------------|------------|
+| Baseline (no EF) | **0.7476** | **0.7530** | 0.1933 |
+| Unfrozen ExprField | 0.7418 | 0.7557 | **0.2017** |
+
+  - 几乎没有差异 (ΔOT < 0.6%)
+  - 修复了 pair_idx bug: 原来所有 pair 都用 slice[1] 的表达 + src_slice_id=1
+  - 即使修复后，ExprField 对 DLPFC 的 alignment 无实质帮助
+
+**结论**: ExprField self-reconstruction 在 DLPFC 上无论 frozen/unfrozen 都不能提升 alignment。
+核心原因: 在 grid data 上 coords→expression mapping 拟合质量太差 (R² < 0.1)，
+recon loss 残差大，梯度信号被噪声主导。
+
+---
+
+### Round 10: Embedding-driven Matching (2026-02-11)
+
+**核心 idea**: 用 ExprField 学到的 embedding 替换 PCA 做 matching，分阶段训练
+
+**设计**:
+1. **Stage 0**: 预训练 ExprField (在 reference slice 上 pretrain, 300 epochs)
+2. **Stage 1**: 用 PCA 做 matching，训练 DeformNet (warmup, 与 baseline 相同)
+3. **Stage 2** (epoch 30+): 联合训练 —
+   - 用 ExprField 的 bottleneck embedding (32d, L2 normalized) 替换 PCA embedding
+   - `emb2_batch = F.normalize(expr_field.get_embedding(x2_def), dim=1)` — differentiable through x2_def
+   - `emb1_ef` 预计算参考 embedding，每 10 epoch 刷新
+   - 同时训练 DeformNet (LR×0.5) + ExprField (LR×0.1)
+   - Self-recon loss 作为可选辅助
+
+**DLPFC 实验结果 (9 pairs)**:
+
+| Method | OT Acc | NN Acc | Ratio |
+|--------|--------|--------|-------|
+| Baseline (no EF) | **0.7476** | **0.7530** | **0.1933** |
+| Embedding-driven | 0.7447 | 0.7559 | 0.1905 |
+
+**失败原因 — tau collapse**:
+- 进入 Stage 2 后，tau 从 ~0.64 快速降到 0.05 (floor)，大部分 pair 在 30-40 epoch 内就降到底
+- 只有 S1-P1 例外：tau 稳定在 ~0.34（因为 RMSE=0.072 较大，spatial cost 本身有区分力）
+- 根本原因：ExprField pretrain R² 只有 0.10-0.13 (grid data)，embedding 区分力不够
+- tau 触底后 → feat_dist 对 matching 贡献为零 → 退化为纯 spatial matching → 和 baseline 一样
+- recon loss ~0.78-1.01，无法有效下降（ExprField 对 grid data 拟合能力有限）
+
+**结论**: Embedding-driven matching 在 DLPFC 上无效。
+核心瓶颈仍是 ExprField 在 grid data 上拟合能力不足 (R² < 0.15)。
+代码已 revert 回 baseline。
+
+---
+
 ## Open Questions / Next Steps
-- 能不能只用 ExprField 的 bottleneck embedding 做 cosine similarity loss，而不是 MSE on full expression？
-- 增加 ExprField 拟合能力（更多 HVG、更深网络）能否让 unfrozen 版本更有效？
-- frozen v1 在全量 benchmark 上的表现？
+- ExprField 在非 grid 数据 (MERFISH, STARMap) 上 R² 更高，embedding-driven matching 可能在那里有效
+- 能不能用预训练好的 scVI/scANVI embedding 替代 ExprField embedding？
+- 增加 ExprField 拟合能力（更多 HVG、更深网络）能否让 embedding 更有区分力？
+- frozen v1 (canonical consistency) 在全量 benchmark 上的表现？

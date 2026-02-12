@@ -90,6 +90,22 @@ def compute_P_matrix(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute top-k soft assignment from *x2_def* to *x1*.
 
+    When ``matcher.outlier_weight > 0``, a CPD-style uniform outlier
+    component is added (Myronenko & Song, 2010; Qiu et al., 2024).
+    Each source point gets an additional "no-match" option that competes
+    with the K real neighbours in the softmax.  Points far from all
+    targets (e.g. at tissue edges with no corresponding region in the
+    other slice) have most of their weight absorbed by the outlier
+    component, so their matching loss contribution is automatically
+    down-weighted.
+
+    The outlier logit is derived from CPD's posterior::
+
+        c = (w / (1-w)) · (K / N1)
+
+    where ``w`` is the outlier weight fraction.  Converted to a logit
+    ``log(c)`` and appended to the cost-based logits before softmax.
+
     Args:
         x2_def: ``(N2, 2)`` deformed source coordinates.
         x1: ``(N1, 2)`` target coordinates.
@@ -101,6 +117,7 @@ def compute_P_matrix(
 
     Returns:
         ``(topk_idx, weights)`` both of shape ``(N2, K)``.
+        When outlier is active, ``weights.sum(dim=1) < 1`` for outlier points.
     """
     N2, N1 = x2_def.shape[0], x1.shape[0]
     K = min(topk, N1)
@@ -125,10 +142,25 @@ def compute_P_matrix(
     feat_norm = feat_dist / (matcher.feat_scale + 1e-8)
     unified_cost = spatial_norm + matcher.lambda_feat * feat_norm
 
-    if matcher.sinkhorn_iters > 0:
+    # Logits for real neighbours
+    logits = -unified_cost / matcher.tau  # (N2, K)
+
+    w = matcher.outlier_weight
+    if w > 0:
+        # CPD-style outlier component (Myronenko & Song, 2010)
+        # c = (w/(1-w)) * (K/N1) is the relative strength of the uniform
+        # outlier distribution vs. the Gaussian mixture.
+        c = (w / (1.0 - w + 1e-8)) * (K / N1)
+        outlier_logit = np.log(c + 1e-8)
+        # Append outlier column → softmax over K+1 options
+        outlier_col = torch.full((N2, 1), outlier_logit, device=logits.device)
+        logits_full = torch.cat([logits, outlier_col], dim=1)  # (N2, K+1)
+        weights_full = F.softmax(logits_full, dim=1)
+        weights = weights_full[:, :K]  # (N2, K) — row sum < 1 for outliers
+    elif matcher.sinkhorn_iters > 0:
         weights = _sinkhorn_weights(unified_cost, matcher.tau, matcher.sinkhorn_iters)
     else:
-        weights = F.softmax(-unified_cost / matcher.tau, dim=1)
+        weights = F.softmax(logits, dim=1)
 
     if update_tau:
         matcher.update_tau_em(weights, unified_cost)
@@ -147,10 +179,20 @@ def jacobian_reg(
     alpha: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """SVD-based Jacobian regularization penalizing non-isometric deformation.
+    """SVD-based Jacobian regularization (isometry penalty).
 
-    Computes ``sum(log(sigma_i)^2)`` where ``sigma_i`` are the singular
-    values of the Jacobian ``dF/dx``.
+    Computes the full Jacobian ``J_F = dF/dx`` and penalizes singular values
+    deviating from 1: ``mean(sum(log(sigma_i)^2))``.  This prevents local
+    shape distortion (shear, anisotropic stretch).
+
+    Args:
+        model: Deformation network ``F(x) = x + delta(x)``.
+        x: ``(B, 2)`` input coordinates.
+        alpha: Coarse-to-fine window scalar.
+        eps: Clamp floor for singular values.
+
+    Returns:
+        Scalar loss.
     """
     x = x.requires_grad_(True)
     y = model(x, alpha)
@@ -160,58 +202,9 @@ def jacobian_reg(
         grad_out = torch.zeros_like(y)
         grad_out[:, d] = 1.0
         J[:, d, :] = torch.autograd.grad(y, x, grad_out, create_graph=True, retain_graph=True)[0]
+
     svals = torch.clamp(torch.linalg.svdvals(J), min=eps)
     return (torch.log(svals) ** 2).sum(dim=1).mean()
-
-
-# ============================================================================
-# Repulsion loss (anti-collapse)
-# ============================================================================
-
-
-def repulsion_loss(
-    x_before: torch.Tensor,
-    x_after: torch.Tensor,
-    n_pairs: int = 512,
-) -> torch.Tensor:
-    """Penalize pairwise distance shrinkage to prevent many-to-one collapse.
-
-    Randomly samples point pairs and penalizes cases where the post-deformation
-    distance is smaller than the pre-deformation distance.  This provides a
-    global anti-collapse signal that complements local Jacobian regularization.
-
-    The loss is: ``mean(ReLU(d_before² - d_after²) / (d_before² + eps))``
-    — normalized by original distance so that nearby and far pairs are
-    treated equally.
-
-    Args:
-        x_before: ``(N, 2)`` coordinates before deformation.
-        x_after: ``(N, 2)`` coordinates after deformation.
-        n_pairs: Number of random point pairs to sample.
-
-    Returns:
-        Scalar loss (0 if no shrinkage occurs).
-    """
-    N = x_before.shape[0]
-    n_pairs = min(n_pairs, N * (N - 1) // 2)
-
-    # Random pair indices
-    idx_a = torch.randint(0, N, (n_pairs,), device=x_before.device)
-    idx_b = torch.randint(0, N, (n_pairs,), device=x_before.device)
-    # Avoid self-pairs
-    mask = idx_a != idx_b
-    idx_a, idx_b = idx_a[mask], idx_b[mask]
-    if idx_a.shape[0] == 0:
-        return torch.tensor(0.0, device=x_before.device)
-
-    d_before_sq = (x_before[idx_a] - x_before[idx_b]).pow(2).sum(dim=1)
-    d_after_sq = (x_after[idx_a] - x_after[idx_b]).pow(2).sum(dim=1)
-
-    # Only penalize shrinkage (d_after < d_before)
-    shrinkage = F.relu(d_before_sq - d_after_sq)
-    # Normalize by original distance to treat all scales equally
-    loss = (shrinkage / (d_before_sq + 1e-8)).mean()
-    return loss
 
 
 # ============================================================================
@@ -229,14 +222,26 @@ def compute_matching_loss(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward matching loss.
 
+    When ``matcher.outlier_weight > 0``, uses CPD-style inlier weighting:
+    renormalize weights for target computation, scale per-point loss by
+    inlier probability (Myronenko & Song, 2010).
+
     Returns:
         ``(loss, topk_idx, weights)``
     """
     N2 = x2_def.shape[0]
+    K = min(topk, x1.shape[0])
     topk_idx, weights = compute_P_matrix(x2_def, x1, emb2, emb1, matcher, topk, update_tau=True)
-    x1_neighbors = x1[topk_idx.reshape(-1)].reshape(N2, topk, 2)
-    target = torch.einsum("bk,bkd->bd", weights, x1_neighbors)
-    loss = (x2_def - target).pow(2).sum(dim=1).mean()
+    x1_neighbors = x1[topk_idx.reshape(-1)].reshape(N2, K, 2)
+
+    if matcher.outlier_weight > 0:
+        p_inlier = weights.sum(dim=1)
+        w_norm = weights / (p_inlier.unsqueeze(1) + 1e-8)
+        target = torch.einsum("bk,bkd->bd", w_norm, x1_neighbors)
+        loss = (p_inlier * (x2_def - target).pow(2).sum(dim=1)).mean()
+    else:
+        target = torch.einsum("bk,bkd->bd", weights, x1_neighbors)
+        loss = (x2_def - target).pow(2).sum(dim=1).mean()
     return loss, topk_idx, weights
 
 
@@ -253,6 +258,7 @@ def compute_bidirectional_loss(
 
     The forward loss aligns deformed source → target.
     The reverse loss aligns target → deformed source.
+    When ``matcher.outlier_weight > 0``, CPD-style inlier weighting is applied.
     """
     N2, N1 = x2_def.shape[0], x1.shape[0]
     K = min(topk, N1)
@@ -260,15 +266,29 @@ def compute_bidirectional_loss(
     # Forward: x2_def → x1
     idx_fwd, w_fwd = compute_P_matrix(x2_def, x1, emb2, emb1, matcher, topk, update_tau=True)
     x1_nbrs = x1[idx_fwd.reshape(-1)].reshape(N2, K, 2)
-    target_fwd = torch.einsum("bk,bkd->bd", w_fwd, x1_nbrs)
-    loss_fwd = (x2_def - target_fwd).pow(2).sum(dim=1).mean()
+
+    if matcher.outlier_weight > 0:
+        p_fwd = w_fwd.sum(dim=1)
+        w_fwd_n = w_fwd / (p_fwd.unsqueeze(1) + 1e-8)
+        target_fwd = torch.einsum("bk,bkd->bd", w_fwd_n, x1_nbrs)
+        loss_fwd = (p_fwd * (x2_def - target_fwd).pow(2).sum(dim=1)).mean()
+    else:
+        target_fwd = torch.einsum("bk,bkd->bd", w_fwd, x1_nbrs)
+        loss_fwd = (x2_def - target_fwd).pow(2).sum(dim=1).mean()
 
     # Reverse: x1 → x2_def
     K_rev = min(topk, N2)  # K may differ when x2_def is smaller than x1
     idx_rev, w_rev = compute_P_matrix(x1, x2_def, emb1, emb2, matcher, topk, update_tau=False)
     x2_def_nbrs = x2_def[idx_rev.reshape(-1)].reshape(N1, K_rev, 2)
-    target_rev = torch.einsum("bk,bkd->bd", w_rev, x2_def_nbrs)
-    loss_rev = (x1 - target_rev).pow(2).sum(dim=1).mean()
+
+    if matcher.outlier_weight > 0:
+        p_rev = w_rev.sum(dim=1)
+        w_rev_n = w_rev / (p_rev.unsqueeze(1) + 1e-8)
+        target_rev = torch.einsum("bk,bkd->bd", w_rev_n, x2_def_nbrs)
+        loss_rev = (p_rev * (x1 - target_rev).pow(2).sum(dim=1)).mean()
+    else:
+        target_rev = torch.einsum("bk,bkd->bd", w_rev, x2_def_nbrs)
+        loss_rev = (x1 - target_rev).pow(2).sum(dim=1).mean()
 
     return loss_fwd + weight_rev * loss_rev
 
@@ -305,6 +325,40 @@ def canonical_consistency_loss(
     """
     expr_pred = expr_field.canonical(x2_def)
     return F.mse_loss(expr_pred, expr2_gt.detach())
+
+
+# ============================================================================
+# Embedding cosine consistency loss
+# ============================================================================
+
+
+def embedding_cosine_loss(
+    expr_field: nn.Module,
+    x2_def: torch.Tensor,
+    target_fwd: torch.Tensor,
+) -> torch.Tensor:
+    """Embedding cosine consistency: deformed source and matched target should
+    have similar canonical embeddings.
+
+    Uses the frozen ExprField's ``get_embedding`` to extract bottleneck
+    embeddings at the deformed source positions and the matched target
+    positions, then penalizes cosine dissimilarity.
+
+    Gradients flow through ``x2_def`` to the DeformationNet.
+    The ExprField should be frozen (no grad).
+
+    Args:
+        expr_field: Pre-trained ``ExprField`` (frozen).
+        x2_def: ``(B, 2)`` deformed source coordinates (with grad).
+        target_fwd: ``(B, 2)`` matched target positions (detached).
+
+    Returns:
+        Scalar loss in ``[0, 2]`` (mean of ``1 - cosine_sim``).
+    """
+    emb_src = expr_field.get_embedding(x2_def)            # (B, latent_dim)
+    emb_tgt = expr_field.get_embedding(target_fwd.detach())  # (B, latent_dim)
+    cos_sim = F.cosine_similarity(emb_src, emb_tgt, dim=1)  # (B,)
+    return (1 - cos_sim).mean()
 
 
 # ============================================================================

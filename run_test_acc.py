@@ -72,8 +72,8 @@ ALL_DATASETS = list(SLICE_ORDER.keys())
 # later warmup so coarse-to-fine PE has more time to ramp up
 # ---------------------------------------------------------------------------
 DATASET_OVERRIDES = {
-    # DLPFC (grid): strong Jacobian
-    "DLPFC": {"lam_jacobian": 0.1, "warmup_fraction": 0.3},
+    # DLPFC (grid): strong Jacobian, CPD outlier matching
+    "DLPFC": {"lam_jacobian": 0.1, "warmup_fraction": 0.3, "outlier_weight": 0.3},
     # Non-grid datasets: weaker Jacobian, delayed warmup
     "STARMap": {"lam_jacobian": 0.01, "warmup_fraction": 0.4},
     "BaristaSeq": {"lam_jacobian": 0.01, "warmup_fraction": 0.4},
@@ -94,19 +94,12 @@ def _config_for_dataset(config: PipelineConfig, dataset: str) -> PipelineConfig:
 
     overrides = DATASET_OVERRIDES[key]
     cfg = copy.deepcopy(config)
-    if "lam_jacobian" in overrides:
-        cfg.train.lam_jacobian = overrides["lam_jacobian"]
-    if "warmup_fraction" in overrides:
-        cfg.train.warmup_fraction = overrides["warmup_fraction"]
-    if "topk" in overrides:
-        cfg.train.topk = overrides["topk"]
-    if "batch_size" in overrides:
-        cfg.train.batch_size = overrides["batch_size"]
-    parts = [f"lam_jac={cfg.train.lam_jacobian}", f"warmup={cfg.train.warmup_fraction}"]
-    if "topk" in overrides:
-        parts.append(f"topk={cfg.train.topk}")
-    if "batch_size" in overrides:
-        parts.append(f"bs={cfg.train.batch_size}")
+    for field_name, value in overrides.items():
+        if hasattr(cfg.train, field_name):
+            setattr(cfg.train, field_name, value)
+        elif hasattr(cfg.matcher, field_name):
+            setattr(cfg.matcher, field_name, value)
+    parts = [f"{k}={v}" for k, v in overrides.items()]
     print(f"  [dataset override] {dataset}: {', '.join(parts)}")
     return cfg
 
@@ -116,6 +109,7 @@ def save_results(df_all: pd.DataFrame, output_dir: str = ".") -> None:
 
     has_nn = "Accuracy_NN" in df_all.columns
     has_ratio = "Ratio" in df_all.columns
+    has_clc = "CLC" in df_all.columns
 
     # ---- Per-pair results ----
     csv_path = os.path.join(output_dir, "benchmark_results.csv")
@@ -132,6 +126,8 @@ def save_results(df_all: pd.DataFrame, output_dir: str = ".") -> None:
         metric_cols.append(("Accuracy_NN", "NN"))
     if has_ratio:
         metric_cols.append(("Ratio", "Ratio"))
+    if has_clc:
+        metric_cols.append(("CLC", "CLC"))
 
     def _add_method_stats(row, df_sub, methods, metric_col, suffix):
         """Add mean/std for each method to row dict."""

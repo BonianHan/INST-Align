@@ -44,6 +44,7 @@ class MatcherConfig:
     lambda_feat: float = 1.0
     ema_decay: float = 0.9
     sinkhorn_iters: int = 0  # 0 = softmax (default), >0 = Sinkhorn normalization iterations
+    outlier_weight: float = 0.0  # CPD-style outlier fraction w (0 = off, 0.1-0.5 typical)
 
 
 # ============================================================================
@@ -60,9 +61,6 @@ class TrainConfig:
     lr: float = 1e-3
     weight_rev: float = 1.0
     lam_jacobian: float = 0.015
-    jacobian_samples: int = 512
-    lam_repulsion: float = 0.0     # anti-collapse repulsion loss weight (0 = off)
-    repulsion_pairs: int = 512     # number of random pairs for repulsion loss
     grad_clip: float = 1.0
     warmup_fraction: float = 0.3
     print_every: int = 10
@@ -106,6 +104,7 @@ class ExprFieldConfig:
 
     # During deformation training
     lam_canonical: float = 0.005     # Weight for canonical consistency loss
+    lam_embed_cos: float = 0.0       # Weight for embedding cosine consistency loss (0 = off)
 
     # Expression normalization
     norm_method: str = "per_gene"

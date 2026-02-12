@@ -236,15 +236,20 @@ def pretrain_expr_field_pipeline(
     all_expr_t = torch.tensor(all_expr, device=device)
     _, global_norm_stats = normalize_expression(all_expr_t, ef_config.norm_method)
 
-    # 3. Prepare per-slice data
+    # 3. Prepare per-slice data (with non-zero masks for sparse-aware loss)
     coords_tensors = []
     expr_tensors = []
+    nz_masks = []
     for i in range(len(slices)):
         coords_t = torch.tensor(coords_norm_list[i].astype(np.float32), device=device)
-        expr_raw = torch.tensor(expr_arrays[i][:, top_idx], device=device)
+        expr_sub = expr_arrays[i][:, top_idx]
+        # Non-zero mask: True where pre-normalized expression > 0
+        nz_mask = torch.tensor(expr_sub > 0, device=device)
+        expr_raw = torch.tensor(expr_sub, device=device)
         expr_normed, _ = normalize_expression(expr_raw, ef_config.norm_method, stats=global_norm_stats)
         coords_tensors.append(coords_t)
         expr_tensors.append(expr_normed)
+        nz_masks.append(nz_mask)
 
     # 4. Joint pre-training
     n_slices = len(slices)
@@ -252,7 +257,7 @@ def pretrain_expr_field_pipeline(
           f"pre-training {ef_config.pretrain_epochs} epochs...")
 
     expr_field = ExprField(ef_config, n_genes=n_hvg, n_slices=n_slices).to(device)
-    expr_field = pretrain_expr_field(expr_field, coords_tensors, expr_tensors, ef_config)
+    expr_field = pretrain_expr_field(expr_field, coords_tensors, expr_tensors, ef_config, nz_masks=nz_masks)
 
     return PretrainedExprField(
         model=expr_field,
@@ -383,6 +388,7 @@ def align_pair(
         expr_field=expr_field_model,
         lam_canonical=config.expr_field.lam_canonical if config.use_expr_field else 0.0,
         expr2_canon=expr2_canon,
+        lam_embed_cos=config.expr_field.lam_embed_cos if config.use_expr_field else 0.0,
     )
 
     model.eval()

@@ -12,7 +12,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from inr_align.config import TrainConfig
-from inr_align.loss import canonical_consistency_loss, compute_P_matrix, expression_reconstruction_loss, jacobian_reg, repulsion_loss
+from inr_align.loss import (
+    canonical_consistency_loss, compute_P_matrix,
+    embedding_cosine_loss, expression_reconstruction_loss,
+    jacobian_reg,
+)
 from inr_align.model import DeformationNet, UnifiedCostMatcher
 
 
@@ -46,10 +50,11 @@ def train(
     x2: torch.Tensor,
     emb2: torch.Tensor,
     config: Optional[TrainConfig] = None,
-    # --- ExprField (canonical consistency) ---
+    # --- ExprField ---
     expr_field: Optional[nn.Module] = None,
     lam_canonical: float = 0.0,
     expr2_canon: Optional[torch.Tensor] = None,
+    lam_embed_cos: float = 0.0,
     # --- Expression INR (legacy, optional) ---
     expr_inr: Optional[nn.Module] = None,
     expr2_hvg: Optional[torch.Tensor] = None,
@@ -91,8 +96,12 @@ def train(
     emb1_norm = F.normalize(emb1, dim=1)
     emb2_norm = F.normalize(emb2, dim=1)
 
-    # --- ExprField setup (unfrozen, fine-tuned with lower LR) ---
+    # --- ExprField setup ---
     use_canonical = (expr_field is not None and lam_canonical > 0 and expr2_canon is not None)
+    use_embed_cos = (expr_field is not None and lam_embed_cos > 0)
+    if use_embed_cos and not use_canonical:
+        # Freeze ExprField entirely for embedding cosine loss
+        expr_field.requires_grad_(False)
 
     # --- Expression INR setup (legacy) ---
     use_recon = (expr_inr is not None and expr2_hvg is not None and lam_recon > 0)
@@ -141,6 +150,8 @@ def train(
         epoch_match = 0.0
         epoch_recon = 0.0
         epoch_canon = 0.0
+        epoch_emb_cos = 0.0
+        epoch_inlier = 0.0  # mean inlier probability (CPD outlier)
         n_batch = 0
 
         for bi in range(0, N2, batch_size):
@@ -158,8 +169,18 @@ def train(
                 x2_def, x1, emb2_batch, emb1_norm, matcher, config.topk, update_tau=True
             )
             x1_nbrs = x1[idx_fwd.reshape(-1)].reshape(bs, K, 2)
-            target_fwd = torch.einsum("bk,bkd->bd", w_fwd, x1_nbrs)
-            loss_fwd = (x2_def - target_fwd).pow(2).sum(dim=1).mean()
+
+            # CPD-style outlier handling (Myronenko & Song, 2010):
+            # When outlier_weight > 0, w_fwd.sum(dim=1) < 1 for outlier points.
+            # Renormalize weights for target computation; weight loss by p_inlier.
+            if matcher.outlier_weight > 0:
+                p_inlier_fwd = w_fwd.sum(dim=1)  # (bs,) inlier probability
+                w_fwd_norm = w_fwd / (p_inlier_fwd.unsqueeze(1) + 1e-8)
+                target_fwd = torch.einsum("bk,bkd->bd", w_fwd_norm, x1_nbrs)
+                loss_fwd = (p_inlier_fwd * (x2_def - target_fwd).pow(2).sum(dim=1)).mean()
+            else:
+                target_fwd = torch.einsum("bk,bkd->bd", w_fwd, x1_nbrs)
+                loss_fwd = (x2_def - target_fwd).pow(2).sum(dim=1).mean()
 
             # Reverse loss: target → deformed source
             K_rev = min(config.topk, bs)  # K may differ when last batch is small
@@ -167,23 +188,23 @@ def train(
                 x1, x2_def, emb1_norm, emb2_batch, matcher, config.topk, update_tau=False
             )
             x2_def_nbrs = x2_def[idx_rev.reshape(-1)].reshape(N1, K_rev, 2)
-            target_rev = torch.einsum("bk,bkd->bd", w_rev, x2_def_nbrs)
-            loss_rev = (x1 - target_rev).pow(2).sum(dim=1).mean()
+
+            if matcher.outlier_weight > 0:
+                p_inlier_rev = w_rev.sum(dim=1)  # (N1,) inlier probability
+                w_rev_norm = w_rev / (p_inlier_rev.unsqueeze(1) + 1e-8)
+                target_rev = torch.einsum("bk,bkd->bd", w_rev_norm, x2_def_nbrs)
+                loss_rev = (p_inlier_rev * (x1 - target_rev).pow(2).sum(dim=1)).mean()
+            else:
+                target_rev = torch.einsum("bk,bkd->bd", w_rev, x2_def_nbrs)
+                loss_rev = (x1 - target_rev).pow(2).sum(dim=1).mean()
 
             L_match = loss_fwd + config.weight_rev * loss_rev
 
-            # Jacobian regularization
+            # Jacobian regularization (SVD: isometry)
+            loss = L_match
             if config.lam_jacobian > 0:
-                jac_idx = torch.randperm(bs, device=device)[: min(config.jacobian_samples, bs)]
-                L_jac = jacobian_reg(model, x2_input[jac_idx], alpha_t)
-                loss = L_match + config.lam_jacobian * L_jac
-            else:
-                loss = L_match
-
-            # Repulsion loss (anti-collapse)
-            if config.lam_repulsion > 0:
-                L_rep = repulsion_loss(x2_batch.detach(), x2_def, n_pairs=config.repulsion_pairs)
-                loss = loss + config.lam_repulsion * L_rep
+                L_jac = jacobian_reg(model, x2_input, alpha_t)
+                loss = loss + config.lam_jacobian * L_jac
 
             # Expression reconstruction loss (legacy, only after warmup)
             L_recon_val = 0.0
@@ -201,6 +222,13 @@ def train(
                 loss = loss + canon_weight * L_canon
                 L_canon_val = L_canon.item()
 
+            # Embedding cosine consistency loss (frozen ExprField, after warmup)
+            L_emb_cos_val = 0.0
+            if use_embed_cos and ep >= warmup:
+                L_emb_cos = embedding_cosine_loss(expr_field, x2_def, target_fwd)
+                loss = loss + lam_embed_cos * L_emb_cos
+                L_emb_cos_val = L_emb_cos.item()
+
             loss.backward()
             if config.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
@@ -210,6 +238,9 @@ def train(
             epoch_match += L_match.item()
             epoch_recon += L_recon_val
             epoch_canon += L_canon_val
+            epoch_emb_cos += L_emb_cos_val
+            if matcher.outlier_weight > 0:
+                epoch_inlier += p_inlier_fwd.mean().item()
             n_batch += 1
 
         avg_match = epoch_match / n_batch
@@ -229,14 +260,18 @@ def train(
             record["recon"] = epoch_recon / n_batch
         if use_canonical:
             record["canonical"] = epoch_canon / n_batch
+        if use_embed_cos:
+            record["emb_cos"] = epoch_emb_cos / n_batch
         history.append(record)
 
         if ep % config.print_every == 0 or ep == config.epochs - 1:
             recon_str = f" recon={epoch_recon / n_batch:.5f}" if use_recon else ""
             canon_str = f" canon={epoch_canon / n_batch:.5f}" if use_canonical else ""
+            emb_cos_str = f" emb_cos={epoch_emb_cos / n_batch:.5f}" if use_embed_cos else ""
+            inlier_str = f" inlier={epoch_inlier / n_batch:.3f}" if matcher.outlier_weight > 0 else ""
             print(
                 f"  ep={ep:03d} | lr={cur_lr:.1e} | \u03c4={matcher.tau:.5f} | "
-                f"loss={epoch_loss / n_batch:.5f} match={avg_match:.5f}{recon_str}{canon_str}"
+                f"loss={epoch_loss / n_batch:.5f} match={avg_match:.5f}{recon_str}{canon_str}{emb_cos_str}{inlier_str}"
             )
 
         # Log LR changes

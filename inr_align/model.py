@@ -140,11 +140,94 @@ class DeformationNet(nn.Module):
     # --------------------------------------------------------------------- #
 
     def _snap_to_grid(self, coords: torch.Tensor) -> torch.Tensor:
-        relative = coords - self.grid_origin if self.grid_origin is not None else coords
-        snapped = torch.round(relative / self.grid_spacing) * self.grid_spacing
-        if self.grid_origin is not None:
-            snapped = snapped + self.grid_origin
-        return snapped
+        """Snap coordinates to grid with exclusive assignment (no overlap).
+
+        Each point is assigned to its nearest grid cell.  When multiple
+        points compete for the same cell, the closest one wins and the
+        others are reassigned to the nearest *unoccupied* cell using a
+        greedy strategy ordered by snap-distance.
+
+        This guarantees a one-to-one mapping between input points and
+        grid positions, eliminating the many-to-one collapse that plain
+        ``torch.round`` would cause.
+        """
+        device = coords.device
+        origin = self.grid_origin if self.grid_origin is not None else torch.zeros(2, device=device)
+        spacing = self.grid_spacing
+
+        # --- Naive snap (same as before) ---
+        relative = coords - origin
+        grid_idx = torch.round(relative / spacing).long()   # (N, 2) integer grid indices
+        snapped_naive = grid_idx.float() * spacing + origin  # (N, 2) snapped coords
+
+        # --- Detect collisions and resolve with exclusive assignment ---
+        N = coords.shape[0]
+
+        # Encode grid index as a single integer for collision detection
+        # Shift indices to be non-negative
+        min_idx = grid_idx.min(dim=0).values
+        shifted = grid_idx - min_idx  # (N, 2) non-negative
+        W = shifted[:, 0].max().item() + 1  # width of bounding box
+        flat_idx = shifted[:, 1] * int(W) + shifted[:, 0]  # (N,) unique per grid cell
+
+        # Check for duplicates
+        unique_flat, inverse, counts = torch.unique(flat_idx, return_inverse=True, return_counts=True)
+        if counts.max().item() <= 1:
+            # No collisions — fast path
+            return snapped_naive
+
+        # --- Greedy exclusive assignment ---
+        # Distance from each point to its naive snap target
+        snap_dist = (coords - snapped_naive).pow(2).sum(dim=1)  # (N,)
+
+        # Sort all points by snap distance (closest first = highest priority)
+        order = torch.argsort(snap_dist)
+
+        result = coords.clone()
+        occupied = set()  # set of (gx, gy) tuples already taken
+
+        # Pre-compute a search radius: check neighbors within a few grid cells
+        gx_all = grid_idx[:, 0].cpu().numpy()
+        gy_all = grid_idx[:, 1].cpu().numpy()
+
+        for rank in range(N):
+            i = order[rank].item()
+            gx, gy = int(gx_all[i]), int(gy_all[i])
+
+            if (gx, gy) not in occupied:
+                # First come, first served
+                occupied.add((gx, gy))
+                result[i] = snapped_naive[i]
+            else:
+                # Find nearest unoccupied grid cell via expanding search
+                cx, cy = relative[i, 0].item() / spacing[0].item(), relative[i, 1].item() / spacing[1].item()
+                best_pos = None
+                best_d2 = float('inf')
+                for r in range(1, 20):  # search radius up to 20 grid cells
+                    found = False
+                    for dx in range(-r, r + 1):
+                        for dy in range(-r, r + 1):
+                            if abs(dx) != r and abs(dy) != r:
+                                continue  # only check the ring at distance r
+                            nx, ny = gx + dx, gy + dy
+                            if (nx, ny) not in occupied:
+                                d2 = (nx - cx) ** 2 + (ny - cy) ** 2
+                                if d2 < best_d2:
+                                    best_d2 = d2
+                                    best_pos = (nx, ny)
+                                    found = True
+                    if found and best_d2 <= (r - 0.5) ** 2:
+                        # Can't find anything closer in outer rings
+                        break
+                if best_pos is not None:
+                    occupied.add(best_pos)
+                    result[i, 0] = best_pos[0] * spacing[0] + origin[0]
+                    result[i, 1] = best_pos[1] * spacing[1] + origin[1]
+                else:
+                    # Fallback: keep naive snap (shouldn't happen)
+                    result[i] = snapped_naive[i]
+
+        return result
 
 
 # ============================================================================
@@ -169,6 +252,7 @@ class UnifiedCostMatcher:
         self.lambda_feat = config.lambda_feat
         self.ema_decay = config.ema_decay
         self.sinkhorn_iters = config.sinkhorn_iters
+        self.outlier_weight = config.outlier_weight
         self.spatial_scale: float = 1.0
         self.feat_scale: float = 1.0
 
@@ -474,11 +558,56 @@ def pretrain_expression_inr(
 # ---- ExprField joint pre-training --------------------------------------------
 
 
+def _sparse_recon_loss(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    nz_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Sparse-aware reconstruction loss: MSE_nonzero + L1 + Dice.
+
+    When a non-zero mask is provided, the loss focuses on non-zero entries
+    (which carry biological signal) and penalizes incorrect zero/non-zero
+    predictions via a soft Dice loss.
+
+    Args:
+        pred: ``(N, G)`` predicted expression.
+        gt: ``(N, G)`` ground-truth expression (z-score normalized).
+        nz_mask: ``(N, G)`` boolean mask — ``True`` where the *pre-normalized*
+            expression was non-zero.  ``None`` falls back to plain MSE.
+
+    Returns:
+        Scalar loss.
+    """
+    if nz_mask is None:
+        return F.mse_loss(pred, gt)
+
+    # 1. MSE on non-zero entries (biological signal)
+    nz_count = nz_mask.sum()
+    if nz_count > 0:
+        mse_nz = (pred[nz_mask] - gt[nz_mask]).pow(2).mean()
+    else:
+        mse_nz = F.mse_loss(pred, gt)
+
+    # 2. L1 over all entries (robust to outliers)
+    l1 = F.l1_loss(pred, gt)
+
+    # 3. Soft Dice loss on the non-zero pattern
+    #    pred_prob = sigmoid(pred) is the "probability" a gene is expressed
+    #    gt_binary = nz_mask.float()
+    pred_prob = torch.sigmoid(pred)
+    gt_binary = nz_mask.float()
+    intersection = (pred_prob * gt_binary).sum()
+    dice = 1.0 - (2.0 * intersection + 1.0) / (pred_prob.sum() + gt_binary.sum() + 1.0)
+
+    return mse_nz + l1 + dice
+
+
 def pretrain_expr_field(
     expr_field: ExprField,
     coords_list: list,
     expr_list: list,
     config: Optional[ExprFieldConfig] = None,
+    nz_masks: Optional[list] = None,
 ) -> ExprField:
     """Pre-train ExprField jointly on all slices.
 
@@ -490,6 +619,9 @@ def pretrain_expr_field(
         coords_list: List of ``(N_s, 2)`` coordinate tensors per slice (on device).
         expr_list: List of ``(N_s, G)`` expression tensors per slice (on device).
         config: ExprField hyper-parameters.
+        nz_masks: Optional list of ``(N_s, G)`` boolean tensors indicating
+            which entries were non-zero before normalization.  When provided,
+            uses sparse-aware loss (MSE_nz + L1 + Dice).
 
     Returns:
         Trained ``ExprField`` with best checkpoint restored.
@@ -504,6 +636,10 @@ def pretrain_expr_field(
     best_loss = float("inf")
     best_state = None
     start = time.time()
+
+    use_sparse = nz_masks is not None
+    if use_sparse:
+        print("    Using sparse-aware loss (MSE_nz + L1 + Dice)")
 
     # Build per-slice slice_id tensors
     slice_ids = [
@@ -521,7 +657,8 @@ def pretrain_expr_field(
         total_recon = 0.0
         for s in range(n_slices):
             pred = expr_field(coords_list[s], slice_ids[s], alpha_t)
-            total_recon = total_recon + F.mse_loss(pred, expr_list[s])
+            mask_s = nz_masks[s] if use_sparse else None
+            total_recon = total_recon + _sparse_recon_loss(pred, expr_list[s], mask_s)
 
         # L2 regularization on batch embeddings
         batch_reg = config.pretrain_batch_reg * expr_field.batch_emb.weight.pow(2).mean()
@@ -539,7 +676,7 @@ def pretrain_expr_field(
                 batch_norm = expr_field.batch_emb.weight.norm(dim=1).mean().item()
             print(
                 f"    ExprField pretrain ep={ep:03d} | "
-                f"MSE={total_recon.item() / n_slices:.6f} | "
+                f"loss={loss.item():.6f} | "
                 f"batch_reg={batch_reg.item():.6f} | "
                 f"batch_norm={batch_norm:.4f}"
             )

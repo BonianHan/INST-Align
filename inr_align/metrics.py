@@ -1,12 +1,13 @@
 """Evaluation metrics for spatial transcriptomics alignment.
 
-Provides five families of metrics:
+Provides six families of metrics:
 
 1. **NN accuracy** — nearest-neighbour label agreement.
 2. **OT accuracy** — label overlap weighted by optimal transport plan.
 3. **PASTE-style accuracy** — uses a precomputed transport plan ``pi``.
 4. **CLC** — Contextual Label Consistency.
-5. **iSTBench metrics** — Accuracy + Ratio across consecutive slices.
+5. **Gene-expression similarity** — NN-matched PCA cosine similarity.
+6. **iSTBench metrics** — Accuracy + Ratio across consecutive slices.
 """
 
 from __future__ import annotations
@@ -199,43 +200,103 @@ def calculate_clc(
 ) -> float:
     """Contextual Label Consistency.
 
-    Checks whether the neighbourhood structure is preserved after
-    alignment and labels are consistent.
+    For each cell *i* in the moving slice (coords2), find its nearest
+    match *i'* in the fixed slice (coords1).  If the labels agree, check
+    what fraction of *i*'s spatial neighbours in coords2, once mapped to
+    coords1, fall within *i'*'s spatial neighbourhood in coords1.
+
+    Higher CLC means better preservation of local spatial context.
     """
     l1 = np.asarray(labels1)
     l2 = np.asarray(labels2)
-    c1 = np.asarray(coords1)
-    c2 = np.asarray(coords2_aligned)
+    c1 = np.asarray(coords1, dtype=np.float64)
+    c2 = np.asarray(coords2_aligned, dtype=np.float64)
 
     n1, n2 = len(c1), len(c2)
     k = max(1, int(((n1 + n2) / 2) * k_percent))
 
+    # Mapping: each cell in c2 → nearest cell in c1
     tree1 = cKDTree(c1)
-    _, idx_map = tree1.query(c2, k=1)
+    _, idx_map = tree1.query(c2, k=1)           # (n2,)
 
-    label_match = l1[idx_map] == l2
+    label_match = (l1[idx_map] == l2)            # (n2,) bool
 
+    # Neighbours in the moving slice (c2)
     tree2 = cKDTree(c2)
     _, nbr_moving = tree2.query(c2, k=k + 1)
-    nbr_moving = nbr_moving[:, 1:]
+    nbr_moving = nbr_moving[:, 1:]              # (n2, k)
 
+    # Neighbours in the fixed slice (c1)
     _, nbr_fixed = tree1.query(c1, k=k + 1)
-    nbr_fixed = nbr_fixed[:, 1:]
+    nbr_fixed = nbr_fixed[:, 1:]               # (n1, k)
 
+    # Vectorised: map neighbours of i in c2 → c1
+    mapped_nbrs = idx_map[nbr_moving]           # (n2, k) — mapped neighbour indices
+    fixed_nbrs = nbr_fixed[idx_map]             # (n2, k) — fixed-space neighbours of i'
+
+    # Sort rows for fast set-intersection via searchsorted
+    mapped_nbrs_sorted = np.sort(mapped_nbrs, axis=1)
+    fixed_nbrs_sorted = np.sort(fixed_nbrs, axis=1)
+
+    # Count overlap per row
     scores = np.zeros(n2)
     for i in range(n2):
         if not label_match[i]:
             continue
-        mapped_nbrs = set(idx_map[nbr_moving[i]])
-        fixed_nbrs = set(nbr_fixed[idx_map[i]])
-        overlap = len(mapped_nbrs & fixed_nbrs)
+        # np.intersect1d is faster than set for sorted arrays
+        overlap = np.intersect1d(mapped_nbrs_sorted[i], fixed_nbrs_sorted[i], assume_unique=False).size
         scores[i] = overlap / k
 
     return float(scores.mean())
 
 
 # ============================================================================
-# 5. Comprehensive evaluation
+# 5. Gene-expression similarity (NN-matched PCA cosine similarity)
+# ============================================================================
+
+
+def gene_expr_similarity(
+    coords1: NDArray,
+    coords2_aligned: NDArray,
+    emb1: NDArray,
+    emb2: NDArray,
+) -> float:
+    """Mean cosine similarity of NN-matched PCA embeddings after alignment.
+
+    For each cell in *coords2_aligned*, find its nearest neighbour in
+    *coords1*, then compute the cosine similarity between their PCA
+    embeddings.  Higher means the aligned cells have more similar
+    expression profiles.
+
+    Args:
+        coords1: ``(N1, 2)`` target spatial coordinates.
+        coords2_aligned: ``(N2, 2)`` aligned source spatial coordinates.
+        emb1: ``(N1, D)`` PCA embeddings for slice 1.
+        emb2: ``(N2, D)`` PCA embeddings for slice 2.
+
+    Returns:
+        Mean cosine similarity in ``[0, 1]``.
+    """
+    c1 = np.asarray(coords1, dtype=np.float64)
+    c2 = np.asarray(coords2_aligned, dtype=np.float64)
+    e1 = np.asarray(emb1, dtype=np.float64)
+    e2 = np.asarray(emb2, dtype=np.float64)
+
+    tree1 = cKDTree(c1)
+    _, idx = tree1.query(c2, k=1)  # (N2,)
+
+    # Cosine similarity per matched pair
+    matched_e1 = e1[idx]  # (N2, D)
+    dot = np.sum(matched_e1 * e2, axis=1)
+    norm1 = np.linalg.norm(matched_e1, axis=1) + 1e-12
+    norm2 = np.linalg.norm(e2, axis=1) + 1e-12
+    cos_sim = dot / (norm1 * norm2)
+
+    return float(np.mean(cos_sim))
+
+
+# ============================================================================
+# 6. Comprehensive evaluation
 # ============================================================================
 
 
