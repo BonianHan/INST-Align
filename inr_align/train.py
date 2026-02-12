@@ -162,7 +162,7 @@ def train(
 
             optimizer.zero_grad(set_to_none=True)
             x2_input = x2_batch.requires_grad_(True)
-            x2_def = model(x2_input, alpha_t)
+            x2_def = model(x2_input, alpha_t, snap_to_grid=config.snap_to_grid_training)
 
             # Forward loss: deformed source → target
             idx_fwd, w_fwd = compute_P_matrix(

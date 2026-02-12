@@ -392,7 +392,11 @@ def align_pair(
     )
 
     model.eval()
-    x2_def = apply_model(model, x2, snap_to_grid=is_grid)
+    use_snap = bool(is_grid and config.train.snap_to_grid_inference)
+    if use_snap and config.matcher.outlier_weight > 0 and config.train.disable_snap_when_cpd:
+        use_snap = False
+        print("  Snap disabled at inference because CPD outlier is enabled (disable_snap_when_cpd=True)")
+    x2_def = apply_model(model, x2, snap_to_grid=use_snap)
     coords_final = denormalize_coordinates(x2_def.cpu().numpy(), mean, std)
 
     return coords_final, result

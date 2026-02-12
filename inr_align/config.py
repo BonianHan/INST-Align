@@ -67,6 +67,9 @@ class TrainConfig:
     scheduler_patience: int = 50   # ReduceLROnPlateau: epochs without improvement before LR drop
     scheduler_factor: float = 0.5  # LR multiplied by this factor on plateau
     scheduler_min_lr: float = 1e-6 # minimum LR floor
+    snap_to_grid_training: bool = False  # Snap during training (non-differentiable; usually False)
+    snap_to_grid_inference: bool = True  # Snap final coordinates for grid datasets
+    disable_snap_when_cpd: bool = True   # If CPD outlier is on, disable snap at inference by default
 
 
 # ============================================================================
