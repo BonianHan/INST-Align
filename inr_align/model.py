@@ -73,13 +73,19 @@ class NerfiesPositionalEncoding(nn.Module):
 
 
 class DeformationNet(nn.Module):
-    """Residual MLP that predicts per-point spatial displacements.
+    """Residual MLP that predicts per-point spatial displacements and
+    (optionally) per-point embeddings.
 
-    The output is ``x + delta(x)`` so that the identity mapping is the
-    default at initialization (last-layer weights near zero).
+    The coordinate output is ``x + delta(x)`` so that the identity mapping
+    is the default at initialization (last-layer weights near zero).
+
+    When ``emb_dim > 0``, a separate embedding head produces a dense
+    representation at each point, suitable for KL-alignment with
+    pre-computed Splane embeddings and downstream gene reconstruction.
 
     Args:
         config: Architecture hyper-parameters.
+        emb_dim: Embedding dimension (0 = no embedding head).
         grid_mode: Whether the data lies on a regular grid.
         grid_spacing: ``(spacing_x, spacing_y)`` for grid snapping.
         grid_origin: ``(x0, y0)`` origin of the grid.
@@ -89,6 +95,7 @@ class DeformationNet(nn.Module):
         self,
         config: Optional[ModelConfig] = None,
         *,
+        emb_dim: int = 0,
         grid_mode: bool = False,
         grid_spacing: Optional[list] = None,
         grid_origin: Optional[NDArray] = None,
@@ -99,6 +106,7 @@ class DeformationNet(nn.Module):
 
         self.encoder = NerfiesPositionalEncoding(config.d, config.n_freqs, config.max_freq_log2)
         self.n_freqs = config.n_freqs
+        self.emb_dim = emb_dim
         self.grid_mode = grid_mode
 
         if grid_spacing is not None:
@@ -111,19 +119,33 @@ class DeformationNet(nn.Module):
         else:
             self.grid_origin = None
 
-        # Build MLP
-        net = []
+        # Shared backbone: PE → hidden layers
+        backbone = []
         in_dim = self.encoder.d_out
         for i in range(config.layers - 1):
-            net.append(nn.Linear(in_dim if i == 0 else config.hidden, config.hidden))
-            net.append(nn.ReLU())
-        net.append(nn.Linear(config.hidden, config.d))
-        self.net = nn.Sequential(*net)
+            backbone.append(nn.Linear(in_dim if i == 0 else config.hidden, config.hidden))
+            backbone.append(nn.ReLU())
+        self.backbone = nn.Sequential(*backbone)
 
-        # Near-identity initialization
+        # Coordinate head: hidden → 2D displacement
+        self.coord_head = nn.Linear(config.hidden, config.d)
         with torch.no_grad():
-            self.net[-1].weight.uniform_(-1e-4, 1e-4)
-            self.net[-1].bias.zero_()
+            self.coord_head.weight.uniform_(-1e-4, 1e-4)
+            self.coord_head.bias.zero_()
+
+        # Embedding head (optional): hidden → emb_dim
+        if emb_dim > 0:
+            self.emb_head = nn.Sequential(
+                nn.Linear(config.hidden, config.hidden),
+                nn.ReLU(),
+                nn.Linear(config.hidden, emb_dim),
+            )
+        else:
+            self.emb_head = None
+
+        # Legacy: self.net for backward compat with jacobian_reg
+        # (jacobian_reg calls model(x, alpha) and expects coord output)
+        self.net = None  # not used; forward() handles routing
 
     def forward(
         self,
@@ -131,11 +153,28 @@ class DeformationNet(nn.Module):
         alpha: Optional[torch.Tensor] = None,
         snap_to_grid: bool = False,
     ) -> torch.Tensor:
-        """Return deformed coordinates ``x + delta(x)``."""
-        x_def = x + self.net(self.encoder(x, alpha))
+        """Return deformed coordinates ``x + delta(x)``.
+
+        When the model has an embedding head, use :meth:`forward_with_emb`
+        to get both outputs. This method always returns only coordinates
+        for backward compatibility with ``jacobian_reg``.
+        """
+        h = self.backbone(self.encoder(x, alpha))
+        x_def = x + self.coord_head(h)
         if snap_to_grid and self.grid_mode and self.grid_spacing is not None:
             x_def = self._snap_to_grid(x_def)
         return x_def
+
+    def forward_with_emb(
+        self,
+        x: torch.Tensor,
+        alpha: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return ``(x_deformed, embedding)`` or ``(x_deformed, None)``."""
+        h = self.backbone(self.encoder(x, alpha))
+        x_def = x + self.coord_head(h)
+        emb = self.emb_head(h) if self.emb_head is not None else None
+        return x_def, emb
 
     # --------------------------------------------------------------------- #
 
@@ -231,6 +270,67 @@ class DeformationNet(nn.Module):
 
 
 # ============================================================================
+# Gene Decoder (embedding + batch → gene expression)
+# ============================================================================
+
+
+class GeneDecoder(nn.Module):
+    """Decodes per-cell embeddings (+ batch embedding) to gene expression.
+
+    Architecture::
+
+        [cell_emb (emb_dim) | batch_emb (batch_dim)] → MLP → n_genes
+
+    The batch embedding is learned per-slice and initialized to zero so that
+    the decoder starts from a batch-free state.
+
+    Args:
+        emb_dim: Input cell embedding dimension (must match DeformationNet's ``emb_dim``).
+        batch_dim: Per-slice batch embedding dimension.
+        hidden: Hidden layer width.
+        layers: Number of hidden layers.
+        n_genes: Number of output genes (HVG).
+        n_slices: Number of slices (for batch embedding table).
+    """
+
+    def __init__(
+        self,
+        emb_dim: int = 16,
+        batch_dim: int = 16,
+        hidden: int = 256,
+        layers: int = 2,
+        n_genes: int = 2000,
+        n_slices: int = 4,
+    ):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.batch_dim = batch_dim
+        self.batch_emb = nn.Embedding(n_slices, batch_dim)
+        nn.init.zeros_(self.batch_emb.weight)
+
+        dec = []
+        in_d = emb_dim + batch_dim
+        for i in range(layers):
+            dec.append(nn.Linear(in_d if i == 0 else hidden, hidden))
+            dec.append(nn.ReLU())
+        dec.append(nn.Linear(hidden, n_genes))
+        self.decoder = nn.Sequential(*dec)
+
+    def forward(self, emb: torch.Tensor, slice_id: torch.Tensor) -> torch.Tensor:
+        """Predict gene expression from cell embedding + batch.
+
+        Args:
+            emb: ``(N, emb_dim)`` cell embeddings from DeformationNet.
+            slice_id: ``(N,)`` integer slice indices.
+
+        Returns:
+            ``(N, n_genes)`` predicted expression.
+        """
+        b = self.batch_emb(slice_id)
+        return self.decoder(torch.cat([emb, b], dim=-1))
+
+
+# ============================================================================
 # Unified Cost Matcher
 # ============================================================================
 
@@ -252,7 +352,6 @@ class UnifiedCostMatcher:
         self.lambda_feat = config.lambda_feat
         self.ema_decay = config.ema_decay
         self.sinkhorn_iters = config.sinkhorn_iters
-        self.outlier_weight = config.outlier_weight
         self.spatial_scale: float = 1.0
         self.feat_scale: float = 1.0
 
@@ -352,11 +451,9 @@ class ExprField(nn.Module):
                               ↓
                         concat with batch_emb (N, batch_emb_dim)
                               ↓
-                        backbone MLP (hidden layers)
+                        encoder MLP → embedding (N, latent_dim)
                               ↓
-                        bottleneck (N, latent_dim)   ← clustering embedding
-                              ↓
-                        head linear → expression (N, n_genes)
+                        decoder MLP → expression (N, n_genes)
 
     Args:
         config: Architecture hyper-parameters.
@@ -367,7 +464,7 @@ class ExprField(nn.Module):
     def __init__(
         self,
         config: Optional[ExprFieldConfig] = None,
-        n_genes: int = 200,
+        n_genes: int = 2000,
         n_slices: int = 2,
     ):
         super().__init__()
@@ -384,22 +481,36 @@ class ExprField(nn.Module):
         self.batch_emb = nn.Embedding(n_slices, config.batch_emb_dim)
         nn.init.zeros_(self.batch_emb.weight)  # start at zero → canonical by default
 
-        # Backbone MLP: PE + batch_emb → hidden
-        backbone_layers = []
+        # Encoder MLP: PE + batch_emb → embedding
+        enc_layers = []
         in_dim = self.encoder.d_out + config.batch_emb_dim
-        for i in range(config.layers - 1):
-            backbone_layers.append(nn.Linear(in_dim if i == 0 else config.hidden, config.hidden))
-            backbone_layers.append(nn.ReLU())
-        self.backbone = nn.Sequential(*backbone_layers)
+        for i in range(config.encoder_layers):
+            enc_layers.append(nn.Linear(in_dim if i == 0 else config.hidden, config.hidden))
+            enc_layers.append(nn.ReLU())
+        enc_layers.append(nn.Linear(config.hidden, config.latent_dim))
+        self.to_embedding = nn.Sequential(*enc_layers)
 
-        # Bottleneck: hidden → latent_dim
-        self.bottleneck = nn.Linear(config.hidden, config.latent_dim)
+        # Decoder MLP: embedding → genes
+        dec_layers = []
+        for i in range(config.decoder_layers):
+            dec_layers.append(nn.Linear(config.latent_dim if i == 0 else config.hidden, config.hidden))
+            dec_layers.append(nn.ReLU())
+        dec_layers.append(nn.Linear(config.hidden, n_genes))
+        self.decoder = nn.Sequential(*dec_layers)
 
-        # Head: latent_dim → n_genes
-        self.head = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(config.latent_dim, n_genes),
-        )
+    def _encode(
+        self,
+        coords: torch.Tensor,
+        slice_id: Optional[torch.Tensor] = None,
+        alpha: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Encode coords to embedding vector."""
+        pe = self.encoder(coords, alpha)
+        if slice_id is not None:
+            b = self.batch_emb(slice_id)
+        else:
+            b = torch.zeros(coords.shape[0], self.batch_emb_dim, device=coords.device)
+        return self.to_embedding(torch.cat([pe, b], dim=-1))
 
     def forward(
         self,
@@ -418,14 +529,8 @@ class ExprField(nn.Module):
         Returns:
             ``(N, n_genes)`` predicted expression values.
         """
-        pe = self.encoder(coords, alpha)
-        if slice_id is not None:
-            b = self.batch_emb(slice_id)
-        else:
-            b = torch.zeros(coords.shape[0], self.batch_emb_dim, device=coords.device)
-        h = self.backbone(torch.cat([pe, b], dim=-1))
-        z = self.bottleneck(h)
-        return self.head(z)
+        z = self._encode(coords, slice_id, alpha)
+        return self.decoder(z)
 
     def canonical(self, coords: torch.Tensor, alpha: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Batch-free canonical prediction (batch_emb = zero).
@@ -440,7 +545,7 @@ class ExprField(nn.Module):
         return self.forward(coords, slice_id=None, alpha=alpha)
 
     def get_embedding(self, coords: torch.Tensor, alpha: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Extract bottleneck embedding for clustering.
+        """Extract embedding for clustering.
 
         Uses canonical mode (batch_emb = zero) to produce batch-free
         representations.
@@ -452,10 +557,7 @@ class ExprField(nn.Module):
         Returns:
             ``(N, latent_dim)`` canonical embedding.
         """
-        pe = self.encoder(coords, alpha)
-        b = torch.zeros(coords.shape[0], self.batch_emb_dim, device=coords.device)
-        h = self.backbone(torch.cat([pe, b], dim=-1))
-        return self.bottleneck(h)
+        return self._encode(coords, slice_id=None, alpha=alpha)
 
 
 # ---- Expression normalization ------------------------------------------------
@@ -558,28 +660,52 @@ def pretrain_expression_inr(
 # ---- ExprField joint pre-training --------------------------------------------
 
 
+def _dice_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Soft Dice loss for zero/non-zero pattern preservation.
+
+    Maps predictions to [-1, 1] via ``2*sigmoid - 1`` to give a stronger
+    gradient signal near zero than plain sigmoid (which saturates at 0/1).
+
+    Args:
+        pred: ``(N, G)`` predicted expression (raw values).
+        gt: ``(N, G)`` ground-truth expression.
+
+    Returns:
+        Scalar Dice loss in ``[0, 1]``.
+    """
+    pred_binary = 2.0 * torch.sigmoid(pred) - 1.0
+    gt_binary = (gt > 0).float()
+    intersection = (pred_binary * gt_binary).sum()
+    union = pred_binary.sum() + gt_binary.sum()
+    dice_coeff = (2.0 * intersection + 1.0) / (union + 1.0)
+    return 1.0 - dice_coeff
+
+
 def _sparse_recon_loss(
     pred: torch.Tensor,
     gt: torch.Tensor,
     nz_mask: Optional[torch.Tensor] = None,
+    dice_weight: float = 0.01,
 ) -> torch.Tensor:
     """Sparse-aware reconstruction loss: MSE_nonzero + L1 + Dice.
 
-    When a non-zero mask is provided, the loss focuses on non-zero entries
-    (which carry biological signal) and penalizes incorrect zero/non-zero
-    predictions via a soft Dice loss.
+    Combines three terms:
+      1. MSE on non-zero entries (biological signal)
+      2. L1 over all entries (sparsity-encouraging, robust to outliers)
+      3. Soft Dice loss on zero/non-zero pattern (weighted by ``dice_weight``)
 
     Args:
         pred: ``(N, G)`` predicted expression.
         gt: ``(N, G)`` ground-truth expression (z-score normalized).
         nz_mask: ``(N, G)`` boolean mask — ``True`` where the *pre-normalized*
-            expression was non-zero.  ``None`` falls back to plain MSE.
+            expression was non-zero.  ``None`` uses ``gt != 0`` as fallback.
+        dice_weight: Weight for the Dice loss term (default 0.01).
 
     Returns:
         Scalar loss.
     """
     if nz_mask is None:
-        return F.mse_loss(pred, gt)
+        nz_mask = gt != 0
 
     # 1. MSE on non-zero entries (biological signal)
     nz_count = nz_mask.sum()
@@ -588,18 +714,13 @@ def _sparse_recon_loss(
     else:
         mse_nz = F.mse_loss(pred, gt)
 
-    # 2. L1 over all entries (robust to outliers)
+    # 2. L1 over all entries (robust to outliers, encourages sparsity)
     l1 = F.l1_loss(pred, gt)
 
     # 3. Soft Dice loss on the non-zero pattern
-    #    pred_prob = sigmoid(pred) is the "probability" a gene is expressed
-    #    gt_binary = nz_mask.float()
-    pred_prob = torch.sigmoid(pred)
-    gt_binary = nz_mask.float()
-    intersection = (pred_prob * gt_binary).sum()
-    dice = 1.0 - (2.0 * intersection + 1.0) / (pred_prob.sum() + gt_binary.sum() + 1.0)
+    dice = _dice_loss(pred, gt)
 
-    return mse_nz + l1 + dice
+    return mse_nz + l1 + dice_weight * dice
 
 
 def pretrain_expr_field(

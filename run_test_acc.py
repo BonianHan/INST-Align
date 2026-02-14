@@ -72,8 +72,8 @@ ALL_DATASETS = list(SLICE_ORDER.keys())
 # later warmup so coarse-to-fine PE has more time to ramp up
 # ---------------------------------------------------------------------------
 DATASET_OVERRIDES = {
-    # DLPFC (grid): strong Jacobian, CPD outlier matching
-    "DLPFC": {"lam_jacobian": 0.1, "warmup_fraction": 0.3, "outlier_weight": 0.3},
+    # DLPFC (grid): strong Jacobian + divergence anti-collapse
+    "DLPFC": {"lam_jacobian": 0.1, "warmup_fraction": 0.3, "lam_divergence": 10.0},
     # Non-grid datasets: weaker Jacobian, delayed warmup
     "STARMap": {"lam_jacobian": 0.01, "warmup_fraction": 0.4},
     "BaristaSeq": {"lam_jacobian": 0.01, "warmup_fraction": 0.4},
@@ -97,8 +97,6 @@ def _config_for_dataset(config: PipelineConfig, dataset: str) -> PipelineConfig:
     for field_name, value in overrides.items():
         if hasattr(cfg.train, field_name):
             setattr(cfg.train, field_name, value)
-        elif hasattr(cfg.matcher, field_name):
-            setattr(cfg.matcher, field_name, value)
     parts = [f"{k}={v}" for k, v in overrides.items()]
     print(f"  [dataset override] {dataset}: {', '.join(parts)}")
     return cfg
@@ -283,6 +281,8 @@ def main(
 
             from inr_align.config import DLPFC_SAMPLE_GROUPS as ALL_GROUPS
             layer_groups = []
+            sample_id_groups = []
+            dataset_folders = []
             for idx in sample_indices:
                 group = ALL_GROUPS[idx]
                 slices = []
@@ -294,6 +294,8 @@ def main(
                     slices.append(adata)
                     print(f"  Loaded {sample_id}: {adata.shape}")
                 layer_groups.append(slices)
+                sample_id_groups.append(list(group))
+                dataset_folders.append(folder)
 
             dlpfc_config = _config_for_dataset(config, "DLPFC")
             df_dlpfc = benchmark_all(
@@ -301,6 +303,8 @@ def main(
                 label_key="original_domain", label_map=DLPFC_LABEL_MAP,
                 run_paste=run_paste, run_spateo=run_spateo,
                 run_spacel=run_spacel, run_stalign=run_stalign,
+                sample_id_groups=sample_id_groups,
+                dataset_folders=dataset_folders,
             )
             # Map Sample index → dataset name
             idx_to_name = {i: f"DLPFC_sample{sample_indices[i] + 1}" for i in range(len(sample_indices))}

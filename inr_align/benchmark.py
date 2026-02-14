@@ -34,11 +34,11 @@ from inr_align.config import DLPFC_SAMPLE_GROUPS, PipelineConfig
 from inr_align.loss import compute_P_matrix
 from inr_align.metrics import calculate_clc, coords_to_pi, mapping_accuracy_nn_bidi, mapping_accuracy_paste, sparse_P_to_dense_pi
 from inr_align.model import (
-    DeformationNet, UnifiedCostMatcher, adaptive_icp,
+    DeformationNet, GeneDecoder, UnifiedCostMatcher, adaptive_icp,
     normalize_expression, ExprField,
 )
 from inr_align.train import apply_model, train
-from inr_align.utils import detect_grid_spacing, normalize_coordinates
+from inr_align.utils import detect_grid_spacing, griddata_resample, normalize_coordinates
 
 
 # ============================================================================
@@ -289,6 +289,69 @@ def run_stalign_baseline(
     return acc_ot, acc_nn, ratio, clc, elapsed
 
 
+def _load_splane_embeddings(
+    slice_obj,
+    sample_id: str,
+    data_dir: str = "./Data",
+    dataset_folder: str = "DLPFC_sample1",
+) -> Optional[np.ndarray]:
+    """Try to load pre-computed Splane embeddings for a slice.
+
+    Looks for ``{data_dir}/{dataset_folder}/splane_embeddings.npz``
+    with key ``emb_{sample_id}``.
+
+    Returns:
+        ``(N, D)`` embedding array or ``None`` if not found.
+    """
+    import os
+    splane_path = os.path.join(data_dir, dataset_folder, "splane_embeddings.npz")
+    if not os.path.exists(splane_path):
+        return None
+    data = np.load(splane_path)
+    key = f"emb_{sample_id}"
+    if key in data:
+        return data[key].astype(np.float32)
+    return None
+
+
+def _prepare_gene_expr(
+    slice_obj,
+    n_hvg: int = 2000,
+    device: str = "cuda",
+) -> Optional[torch.Tensor]:
+    """Extract normalized HVG expression from a slice for gene reconstruction.
+
+    Returns:
+        ``(N, n_hvg)`` tensor on device, or ``None`` on failure.
+    """
+    try:
+        if "highly_variable" in slice_obj.var.columns:
+            hvg_mask = slice_obj.var["highly_variable"].values
+            raw = slice_obj[:, hvg_mask].X
+        else:
+            raw = slice_obj.X
+
+        if scipy.sparse.issparse(raw):
+            raw = raw.toarray()
+        raw = raw.astype(np.float32)
+
+        # Take top n_hvg by variance
+        if raw.shape[1] > n_hvg:
+            var = np.var(raw, axis=0)
+            top_idx = np.argsort(var)[-n_hvg:]
+            raw = raw[:, top_idx]
+
+        # Per-gene z-score
+        mean = raw.mean(axis=0)
+        std_val = raw.std(axis=0) + 1e-8
+        raw_norm = (raw - mean) / std_val
+
+        return torch.tensor(raw_norm, device=device)
+    except Exception as e:
+        print(f"  [WARN] Failed to prepare gene expression: {e}")
+        return None
+
+
 def run_ours(
     slice1,
     slice2,
@@ -296,13 +359,18 @@ def run_ours(
     device: str = "cuda",
     label_key: str = "original_domain",
     label_map: Optional[Dict] = None,
-    pretrained_expr_field=None,
+    splane_emb2_np: Optional[np.ndarray] = None,
+    dataset_folder: str = "DLPFC_sample1",
+    sample_id2: Optional[str] = None,
 ) -> Tuple[Tuple[float, float, float, float], Tuple[float, float, float, float], float]:
     """Our method: adaptive_icp + INR deformation.
 
-    Args:
-        pretrained_expr_field: Pre-trained ``PretrainedExprField``
-            (from :func:`~inr_align.run.pretrain_expr_field_pipeline`).
+    Now supports:
+    - Embedding head (DeformationNet outputs coords + emb_dim-d embedding)
+    - Splane KL loss (emb_head → Splane target)
+    - Gene reconstruction (GeneDecoder: emb + batch → gene expression)
+    - Divergence loss (anti-compression)
+    - Griddata post-processing (replaces snap_to_grid)
 
     Returns:
         ``((acc_ot, acc_nn, ratio, clc), (acc_ot, acc_nn, ratio, clc), elapsed_time)``.
@@ -325,9 +393,9 @@ def run_ours(
 
     spacing_x, spacing_y, is_grid, origin = detect_grid_spacing(coords1_norm)
     if is_grid:
-        print(f"  Grid detected: spacing=({spacing_x:.4f}, {spacing_y:.4f}), snap_to_grid=True")
+        print(f"  Grid detected: spacing=({spacing_x:.4f}, {spacing_y:.4f})")
     else:
-        print(f"  Non-grid data: continuous coordinates, snap_to_grid=False")
+        print(f"  Non-grid data: continuous coordinates")
 
     # Adaptive ICP (with expression-guided rotation selection)
     R, t, angle, rmse = adaptive_icp(
@@ -343,9 +411,27 @@ def run_ours(
     emb1 = torch.tensor(slice1.obsm[config.pca_key].astype(np.float32), device=device)
     emb2 = torch.tensor(slice2.obsm[config.pca_key].astype(np.float32), device=device)
 
-    # Model
+    # --- Splane embeddings ---
+    splane_emb2 = None
+    if splane_emb2_np is not None:
+        splane_emb2 = torch.tensor(splane_emb2_np, device=device)
+        print(f"  Splane embeddings loaded: {splane_emb2.shape}")
+    elif sample_id2 is not None:
+        sp = _load_splane_embeddings(slice2, sample_id2, config.data_dir, dataset_folder)
+        if sp is not None:
+            splane_emb2 = torch.tensor(sp, device=device)
+            print(f"  Splane embeddings loaded: {splane_emb2.shape}")
+        else:
+            print(f"  [WARN] Splane embeddings not found for {sample_id2}")
+
+    # Determine if embedding head should be active
+    has_splane = splane_emb2 is not None
+    emb_dim = config.model.emb_dim if has_splane else 0
+
+    # Model (with embedding head if Splane available)
     model = DeformationNet(
         config.model,
+        emb_dim=emb_dim,
         grid_mode=is_grid,
         grid_spacing=[spacing_x, spacing_y] if is_grid else None,
         grid_origin=origin,
@@ -353,33 +439,61 @@ def run_ours(
 
     matcher = UnifiedCostMatcher(config.matcher)
 
-    # ExprField (canonical consistency)
-    expr_field_model = None
-    expr2_canon = None
-    if pretrained_expr_field is not None and config.use_expr_field:
-        expr_field_model = pretrained_expr_field.model
-        # Prepare source expression for canonical loss
-        top_idx = pretrained_expr_field.gene_indices
-        norm_stats = pretrained_expr_field.norm_stats
-        hvg_mask = slice2.var["highly_variable"].values
-        expr2_raw = slice2[:, hvg_mask].X
-        if scipy.sparse.issparse(expr2_raw):
-            expr2_raw = expr2_raw.toarray()
-        expr2_sub = torch.tensor(expr2_raw[:, top_idx].astype(np.float32), device=device)
-        expr2_canon, _ = normalize_expression(expr2_sub, config.expr_field.norm_method, stats=norm_stats)
+    # --- Gene reconstruction ---
+    gene_decoder = None
+    gene_expr2_gt = None
+    slice_ids2 = None
+    if has_splane and config.train.lam_recon > 0:
+        gene_expr2_gt = _prepare_gene_expr(slice2, n_hvg=config.expr_field.n_hvg, device=device)
+        if gene_expr2_gt is not None:
+            n_genes = gene_expr2_gt.shape[1]
+            gene_decoder = GeneDecoder(
+                emb_dim=emb_dim,
+                batch_dim=16,
+                hidden=256,
+                layers=2,
+                n_genes=n_genes,
+                n_slices=2,
+            ).to(device)
+            # Source slice = slice_id 1
+            slice_ids2 = torch.ones(slice2.shape[0], dtype=torch.long, device=device)
+            print(f"  GeneDecoder: emb_dim={emb_dim}, n_genes={n_genes}")
+
+    # ExprField (legacy joint training)
+    expr_field = None
+    expr2_gt = None
+    if config.use_expr_field:
+        from inr_align.run import _prepare_expr_field
+        expr_field, expr2_gt = _prepare_expr_field(slice1, slice2, config, device)
 
     result = train(
         model, matcher, x1, emb1, x2, emb2, config.train,
-        expr_field=expr_field_model,
-        lam_canonical=config.expr_field.lam_canonical if config.use_expr_field else 0.0,
-        expr2_canon=expr2_canon,
-        lam_embed_cos=config.expr_field.lam_embed_cos if config.use_expr_field else 0.0,
+        expr_field=expr_field,
+        expr2_gt=expr2_gt,
+        lam_expr=config.expr_field.lam_expr if config.use_expr_field else 0.0,
+        splane_emb2=splane_emb2,
+        gene_decoder=gene_decoder,
+        gene_expr2_gt=gene_expr2_gt,
+        slice_ids2=slice_ids2,
     )
 
-    # Apply
+    # Apply deformation
     model.eval()
-    x2_def = apply_model(model, x2, snap_to_grid=is_grid)
-    coords2_final = x2_def.cpu().numpy() * std + mean
+
+    # Use griddata for grid datasets (replaces snap_to_grid)
+    if is_grid and config.train.use_griddata:
+        x2_def = apply_model(model, x2, snap_to_grid=False)
+        coords2_def_norm = x2_def.cpu().numpy()
+        # Denormalize
+        coords2_def_denorm = coords2_def_norm * std + mean
+        # Griddata resampling
+        grid_coords, valid_mask = griddata_resample(coords2_def_denorm, side_length=200)
+        print(f"  Griddata: {coords2_def_denorm.shape[0]} → {grid_coords.shape[0]} points (grid)")
+        coords2_final = coords2_def_denorm  # Keep original deformed coords for metrics
+    else:
+        x2_def = apply_model(model, x2, snap_to_grid=False)
+        coords2_final = x2_def.cpu().numpy() * std + mean
+
     coords2_rigid_denorm = coords2_rigid * std + mean
 
     elapsed = time.time() - start
@@ -423,6 +537,8 @@ def benchmark_all(
     run_spateo: bool = True,
     run_spacel: bool = True,
     run_stalign: bool = True,
+    sample_id_groups: Optional[List[List[str]]] = None,
+    dataset_folders: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """Run all methods on all sample groups.
 
@@ -438,6 +554,10 @@ def benchmark_all(
         run_spateo: Whether to include Spateo baseline.
         run_spacel: Whether to include SPACEL baseline.
         run_stalign: Whether to include STalign baseline.
+        sample_id_groups: ``sample_id_groups[j][i]`` is the sample ID string
+            for group *j*, slice *i*.  Used to load Splane embeddings.
+        dataset_folders: ``dataset_folders[j]`` is the dataset folder name
+            (e.g. ``"DLPFC_sample1"``) for group *j*.
 
     Returns:
         DataFrame with columns ``[Sample, Pair, Method, Time, Accuracy, Accuracy_NN, Ratio, CLC]``.
@@ -451,28 +571,6 @@ def benchmark_all(
     rows = []
 
     for j in range(len(layer_groups)):
-        # Pre-process group for ExprField joint pre-training
-        _pretrained_ef = None
-        if config.use_expr_field:
-            from inr_align.run import pretrain_expr_field_pipeline
-            from inr_align.utils import normalize_coordinates as _norm_coords
-
-            _expr_group_slices = [s.copy() for s in layer_groups[j]]
-            for ad_ in _expr_group_slices:
-                if "counts" not in ad_.layers:
-                    ad_.layers["counts"] = ad_.X.copy()
-                sc.pp.normalize_total(ad_)
-                sc.pp.log1p(ad_)
-                if "highly_variable" not in ad_.var.columns:
-                    sc.pp.highly_variable_genes(ad_, n_top_genes=config.n_top_genes)
-            st.align.group_pca(_expr_group_slices, pca_key=config.pca_key)
-
-            all_coords = [s.obsm[config.spatial_key] for s in _expr_group_slices]
-            coords_norm_list, mean_, std_ = _norm_coords(all_coords)
-            _pretrained_ef = pretrain_expr_field_pipeline(
-                _expr_group_slices, coords_norm_list, config, device,
-            )
-
         for i in range(len(layer_groups[j]) - 1):
             print(f"\n{'=' * 60}")
             print(f"Sample {j}, Pair {i}")
@@ -551,18 +649,27 @@ def benchmark_all(
 
             # --- Ours ---
             try:
+                # Resolve Splane info for this pair
+                _sid2 = None
+                _dfolder = None
+                if sample_id_groups is not None and j < len(sample_id_groups):
+                    _sid2 = sample_id_groups[j][i + 1]  # source slice sample_id
+                if dataset_folders is not None and j < len(dataset_folders):
+                    _dfolder = dataset_folders[j]
+
                 (acc_r_ot, acc_r_nn, ratio_r, clc_r), (acc_sp_ot, acc_sp_nn, ratio_sp, clc_sp), t_o = run_ours(
                     s1.copy(), s2.copy(), config, device, label_key, label_map,
-                    pretrained_expr_field=_pretrained_ef,
+                    dataset_folder=_dfolder or "DLPFC_sample1",
+                    sample_id2=_sid2,
                 )
-                rows.append({"Sample": j, "Pair": i, "Method": "Ours_Rigid", "Time": t_o,
+                rows.append({"Sample": j, "Pair": i, "Method": "INSTA-Rigid", "Time": t_o,
                              "Accuracy": acc_r_ot, "Accuracy_NN": acc_r_nn, "Ratio": ratio_r,
                              "CLC": clc_r})
-                rows.append({"Sample": j, "Pair": i, "Method": "Ours_Spatial", "Time": t_o,
+                rows.append({"Sample": j, "Pair": i, "Method": "INSTA-Nonrigid", "Time": t_o,
                              "Accuracy": acc_sp_ot, "Accuracy_NN": acc_sp_nn, "Ratio": ratio_sp,
                              "CLC": clc_sp})
-                print(f"  {'Ours_Rigid':16s} OT={acc_r_ot:.4f}  NN={acc_r_nn:.4f}  Ratio={ratio_r:.4f}  CLC={clc_r:.4f}")
-                print(f"  {'Ours_Spatial':16s} OT={acc_sp_ot:.4f}  NN={acc_sp_nn:.4f}  Ratio={ratio_sp:.4f}  CLC={clc_sp:.4f}")
+                print(f"  {'INSTA-Rigid':16s} OT={acc_r_ot:.4f}  NN={acc_r_nn:.4f}  Ratio={ratio_r:.4f}  CLC={clc_r:.4f}")
+                print(f"  {'INSTA-Nonrigid':16s} OT={acc_sp_ot:.4f}  NN={acc_sp_nn:.4f}  Ratio={ratio_sp:.4f}  CLC={clc_sp:.4f}")
             except Exception as e:
                 print(f"  Ours failed: {e}")
                 import traceback
@@ -648,7 +755,7 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
     method_order = [
         "No-align", "PASTE", "SPACEL", "STalign",
         "Spateo_Rigid", "Spateo_Nonrigid",
-        "Ours_Rigid", "Ours_Spatial",
+        "INSTA-Rigid", "INSTA-Nonrigid",
     ]
     present = [m for m in method_order if m in df["Method"].unique()]
 
@@ -656,7 +763,7 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
     palette = {
         "No-align": "#999999", "PASTE": "#e6a532", "SPACEL": "#5ba355",
         "STalign": "#d35b5b", "Spateo_Rigid": "#7caed6", "Spateo_Nonrigid": "#4a86b8",
-        "Ours_Rigid": "#d98cd9", "Ours_Spatial": "#9933cc",
+        "INSTA-Rigid": "#d98cd9", "INSTA-Nonrigid": "#9933cc",
     }
 
     # Build list of metrics present in the DataFrame

@@ -28,6 +28,7 @@ class ModelConfig:
     layers: int = 6
     n_freqs: int = 6
     max_freq_log2: int = 5
+    emb_dim: int = 16           # Embedding head dimension (0 = no embedding head)
 
 
 # ============================================================================
@@ -44,7 +45,6 @@ class MatcherConfig:
     lambda_feat: float = 1.0
     ema_decay: float = 0.9
     sinkhorn_iters: int = 0  # 0 = softmax (default), >0 = Sinkhorn normalization iterations
-    outlier_weight: float = 0.0  # CPD-style outlier fraction w (0 = off, 0.1-0.5 typical)
 
 
 # ============================================================================
@@ -61,6 +61,9 @@ class TrainConfig:
     lr: float = 1e-3
     weight_rev: float = 1.0
     lam_jacobian: float = 0.015
+    lam_divergence: float = 10.0   # Divergence penalty — prevents global compression (0 = off)
+    lam_kl: float = 1.0           # Splane embedding KL loss weight (0 = off)
+    lam_recon: float = 0.5        # Gene reconstruction loss weight (0 = off)
     grad_clip: float = 1.0
     warmup_fraction: float = 0.3
     print_every: int = 10
@@ -69,7 +72,7 @@ class TrainConfig:
     scheduler_min_lr: float = 1e-6 # minimum LR floor
     snap_to_grid_training: bool = False  # Snap during training (non-differentiable; usually False)
     snap_to_grid_inference: bool = True  # Snap final coordinates for grid datasets
-    disable_snap_when_cpd: bool = True   # If CPD outlier is on, disable snap at inference by default
+    use_griddata: bool = True      # Use griddata resampling instead of snap_to_grid
 
 
 # ============================================================================
@@ -82,38 +85,29 @@ class ExprFieldConfig:
 
     Architecture::
 
-        coords (N,2) → PE → concat(batch_emb) → backbone MLP
-        → bottleneck (latent_dim) → head → expression (N, n_genes)
+        coords (N,2) → PE → concat(batch_emb) → encoder MLP → embedding (latent_dim)
+        → decoder MLP → expression (N, n_genes)
 
-    The bottleneck forces a compact representation that can be used for
-    clustering (``get_embedding``).  Setting ``batch_emb=0`` yields
-    batch-corrected canonical predictions.
+    Setting ``batch_emb=0`` yields batch-corrected canonical predictions.
     """
 
     # Architecture
     hidden: int = 256
-    layers: int = 4
+    encoder_layers: int = 2          # Number of hidden layers in encoder (PE → embedding)
+    decoder_layers: int = 2          # Number of hidden layers in decoder (embedding → genes)
     n_freqs: int = 6
     max_freq_log2: int = 5
     batch_emb_dim: int = 16          # Per-slice batch embedding dimension
-    latent_dim: int = 32             # Bottleneck dimension (for clustering embedding)
+    latent_dim: int = 32             # Embedding dimension
 
-    # Pre-training (joint, all slices)
-    pretrain_epochs: int = 300
-    pretrain_lr: float = 1e-3
-    pretrain_warmup: float = 0.3
-    pretrain_print_every: int = 50
-    pretrain_batch_reg: float = 0.01  # L2 regularization on batch embeddings
-
-    # During deformation training
-    lam_canonical: float = 0.005     # Weight for canonical consistency loss
-    lam_embed_cos: float = 0.0       # Weight for embedding cosine consistency loss (0 = off)
+    # Loss weight (joint training with deformation)
+    lam_expr: float = 1.0            # Weight for expression reconstruction loss
 
     # Expression normalization
     norm_method: str = "per_gene"
 
     # Feature selection
-    n_hvg: int = 200
+    n_hvg: int = 2000
 
 
 # Keep ExpressionINRConfig as alias for backward compatibility
@@ -168,16 +162,7 @@ class PipelineConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     icp: ICPConfig = field(default_factory=ICPConfig)
     expr_field: ExprFieldConfig = field(default_factory=ExprFieldConfig)
-    use_expr_field: bool = False  # Enable canonical expression field (alignment + batch correction)
-
-    # Backward compatibility aliases
-    @property
-    def expression_inr(self) -> ExprFieldConfig:
-        return self.expr_field
-
-    @property
-    def use_expression_inr(self) -> bool:
-        return self.use_expr_field
+    use_expr_field: bool = False  # Enable expression field for joint training
 
 
 # ============================================================================

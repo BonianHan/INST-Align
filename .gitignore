@@ -11,8 +11,16 @@ result_metrics/
 benchmark_results.csv
 benchmark_summary.csv
 benchmark_results.png
+benchmark_alignment.csv
+benchmark_alignment.png
+benchmark_embedding.csv
 expr_comparison_results.csv
 expr_comparison_summary.csv
+Scube_outputs/
+alignment_overlay.png
+baseline_comparison.png
+dlpfc_exprfield_results.csv
+mouse_embryo_baseline_results.csv
 
 # Python
 __pycache__/
@@ -49,3 +57,7 @@ nul
 
 # Dev log (local only)
 log.txt
+tuning_log.md
+
+# Backup (local only)
+backup_before_refactor/

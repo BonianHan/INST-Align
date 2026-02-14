@@ -90,22 +90,6 @@ def compute_P_matrix(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute top-k soft assignment from *x2_def* to *x1*.
 
-    When ``matcher.outlier_weight > 0``, a CPD-style uniform outlier
-    component is added (Myronenko & Song, 2010; Qiu et al., 2024).
-    Each source point gets an additional "no-match" option that competes
-    with the K real neighbours in the softmax.  Points far from all
-    targets (e.g. at tissue edges with no corresponding region in the
-    other slice) have most of their weight absorbed by the outlier
-    component, so their matching loss contribution is automatically
-    down-weighted.
-
-    The outlier logit is derived from CPD's posterior::
-
-        c = (w / (1-w)) · (K / N1)
-
-    where ``w`` is the outlier weight fraction.  Converted to a logit
-    ``log(c)`` and appended to the cost-based logits before softmax.
-
     Args:
         x2_def: ``(N2, 2)`` deformed source coordinates.
         x1: ``(N1, 2)`` target coordinates.
@@ -117,7 +101,6 @@ def compute_P_matrix(
 
     Returns:
         ``(topk_idx, weights)`` both of shape ``(N2, K)``.
-        When outlier is active, ``weights.sum(dim=1) < 1`` for outlier points.
     """
     N2, N1 = x2_def.shape[0], x1.shape[0]
     K = min(topk, N1)
@@ -142,22 +125,10 @@ def compute_P_matrix(
     feat_norm = feat_dist / (matcher.feat_scale + 1e-8)
     unified_cost = spatial_norm + matcher.lambda_feat * feat_norm
 
-    # Logits for real neighbours
+    # Logits → softmax weights
     logits = -unified_cost / matcher.tau  # (N2, K)
 
-    w = matcher.outlier_weight
-    if w > 0:
-        # CPD-style outlier component (Myronenko & Song, 2010)
-        # c = (w/(1-w)) * (K/N1) is the relative strength of the uniform
-        # outlier distribution vs. the Gaussian mixture.
-        c = (w / (1.0 - w + 1e-8)) * (K / N1)
-        outlier_logit = np.log(c + 1e-8)
-        # Append outlier column → softmax over K+1 options
-        outlier_col = torch.full((N2, 1), outlier_logit, device=logits.device)
-        logits_full = torch.cat([logits, outlier_col], dim=1)  # (N2, K+1)
-        weights_full = F.softmax(logits_full, dim=1)
-        weights = weights_full[:, :K]  # (N2, K) — row sum < 1 for outliers
-    elif matcher.sinkhorn_iters > 0:
+    if matcher.sinkhorn_iters > 0:
         weights = _sinkhorn_weights(unified_cost, matcher.tau, matcher.sinkhorn_iters)
     else:
         weights = F.softmax(logits, dim=1)
@@ -173,26 +144,35 @@ def compute_P_matrix(
 # ============================================================================
 
 
-def jacobian_reg(
+def jacobian_reg_with_div(
     model: nn.Module,
     x: torch.Tensor,
     alpha: torch.Tensor,
     eps: float = 1e-6,
-) -> torch.Tensor:
-    """SVD-based Jacobian regularization (isometry penalty).
+    compression_weight: float = 5.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Asymmetric SVD-based Jacobian regularization + divergence loss.
 
-    Computes the full Jacobian ``J_F = dF/dx`` and penalizes singular values
-    deviating from 1: ``mean(sum(log(sigma_i)^2))``.  This prevents local
-    shape distortion (shear, anisotropic stretch).
+    Computes the full Jacobian ``J_F = dF/dx`` once and extracts two losses:
+
+    1. **SVD loss** (original): penalizes singular values deviating from 1,
+       with compression (σ < 1) penalized ``compression_weight``× more.
+    2. **Divergence loss** (new): penalizes negative divergence
+       ``div(δ) = tr(J_F) - D``, which captures global compression that
+       the SVD loss misses (e.g. uniform σ ≈ 0.995 everywhere).
+
+    The Jacobian computation (the expensive part) is shared between both
+    losses, so the divergence loss has zero additional cost.
 
     Args:
         model: Deformation network ``F(x) = x + delta(x)``.
         x: ``(B, 2)`` input coordinates.
         alpha: Coarse-to-fine window scalar.
         eps: Clamp floor for singular values.
+        compression_weight: Extra penalty multiplier for compression (σ < 1).
 
     Returns:
-        Scalar loss.
+        ``(svd_loss, div_loss)`` — both scalar tensors with gradients.
     """
     x = x.requires_grad_(True)
     y = model(x, alpha)
@@ -203,8 +183,62 @@ def jacobian_reg(
         grad_out[:, d] = 1.0
         J[:, d, :] = torch.autograd.grad(y, x, grad_out, create_graph=True, retain_graph=True)[0]
 
+    # --- SVD loss (original) ---
     svals = torch.clamp(torch.linalg.svdvals(J), min=eps)
-    return (torch.log(svals) ** 2).sum(dim=1).mean()
+    log_svals = torch.log(svals)
+    weights = torch.where(log_svals < 0, compression_weight, 1.0)
+    svd_loss = (weights * log_svals ** 2).sum(dim=1).mean()
+
+    # --- Divergence loss (new) ---
+    # div(delta) = tr(J_F) - D; negative means compression
+    # J_F = I + J_delta, so tr(J_F) = D + tr(J_delta)
+    # We want: tr(J_F) = J[0,0] + J[1,1] for 2D
+    div_delta = J[:, 0, 0] + J[:, 1, 1] - float(D)  # (B,)
+    # Only penalize compression (div < 0), not expansion
+    div_loss = torch.relu(-div_delta).pow(2).mean()
+
+    return svd_loss, div_loss
+
+
+def jacobian_reg(
+    model: nn.Module,
+    x: torch.Tensor,
+    alpha: torch.Tensor,
+    eps: float = 1e-6,
+    compression_weight: float = 5.0,
+) -> torch.Tensor:
+    """Backward-compatible wrapper: returns only the SVD loss.
+
+    See :func:`jacobian_reg_with_div` for the full version.
+    """
+    svd_loss, _ = jacobian_reg_with_div(model, x, alpha, eps, compression_weight)
+    return svd_loss
+
+
+# ============================================================================
+# Embedding KL loss (INR embedding → Splane embedding)
+# ============================================================================
+
+
+def embedding_kl_loss(
+    emb_pred: torch.Tensor,
+    emb_target: torch.Tensor,
+) -> torch.Tensor:
+    """KL divergence between INR-predicted embeddings and Splane embeddings.
+
+    Both inputs are treated as unnormalized logits.  Applies log-softmax
+    to ``emb_pred`` and softmax to ``emb_target``.
+
+    Args:
+        emb_pred: ``(N, D)`` embeddings from DeformationNet.
+        emb_target: ``(N, D)`` pre-computed Splane embeddings.
+
+    Returns:
+        Scalar KL divergence (batchmean).
+    """
+    p = F.log_softmax(emb_pred, dim=1)
+    q = F.softmax(emb_target, dim=1)
+    return F.kl_div(p, q, reduction="batchmean")
 
 
 # ============================================================================
@@ -234,14 +268,8 @@ def compute_matching_loss(
     topk_idx, weights = compute_P_matrix(x2_def, x1, emb2, emb1, matcher, topk, update_tau=True)
     x1_neighbors = x1[topk_idx.reshape(-1)].reshape(N2, K, 2)
 
-    if matcher.outlier_weight > 0:
-        p_inlier = weights.sum(dim=1)
-        w_norm = weights / (p_inlier.unsqueeze(1) + 1e-8)
-        target = torch.einsum("bk,bkd->bd", w_norm, x1_neighbors)
-        loss = (p_inlier * (x2_def - target).pow(2).sum(dim=1)).mean()
-    else:
-        target = torch.einsum("bk,bkd->bd", weights, x1_neighbors)
-        loss = (x2_def - target).pow(2).sum(dim=1).mean()
+    target = torch.einsum("bk,bkd->bd", weights, x1_neighbors)
+    loss = (x2_def - target).pow(2).sum(dim=1).mean()
     return loss, topk_idx, weights
 
 
@@ -258,7 +286,6 @@ def compute_bidirectional_loss(
 
     The forward loss aligns deformed source → target.
     The reverse loss aligns target → deformed source.
-    When ``matcher.outlier_weight > 0``, CPD-style inlier weighting is applied.
     """
     N2, N1 = x2_def.shape[0], x1.shape[0]
     K = min(topk, N1)
@@ -266,29 +293,15 @@ def compute_bidirectional_loss(
     # Forward: x2_def → x1
     idx_fwd, w_fwd = compute_P_matrix(x2_def, x1, emb2, emb1, matcher, topk, update_tau=True)
     x1_nbrs = x1[idx_fwd.reshape(-1)].reshape(N2, K, 2)
-
-    if matcher.outlier_weight > 0:
-        p_fwd = w_fwd.sum(dim=1)
-        w_fwd_n = w_fwd / (p_fwd.unsqueeze(1) + 1e-8)
-        target_fwd = torch.einsum("bk,bkd->bd", w_fwd_n, x1_nbrs)
-        loss_fwd = (p_fwd * (x2_def - target_fwd).pow(2).sum(dim=1)).mean()
-    else:
-        target_fwd = torch.einsum("bk,bkd->bd", w_fwd, x1_nbrs)
-        loss_fwd = (x2_def - target_fwd).pow(2).sum(dim=1).mean()
+    target_fwd = torch.einsum("bk,bkd->bd", w_fwd, x1_nbrs)
+    loss_fwd = (x2_def - target_fwd).pow(2).sum(dim=1).mean()
 
     # Reverse: x1 → x2_def
-    K_rev = min(topk, N2)  # K may differ when x2_def is smaller than x1
+    K_rev = min(topk, N2)
     idx_rev, w_rev = compute_P_matrix(x1, x2_def, emb1, emb2, matcher, topk, update_tau=False)
     x2_def_nbrs = x2_def[idx_rev.reshape(-1)].reshape(N1, K_rev, 2)
-
-    if matcher.outlier_weight > 0:
-        p_rev = w_rev.sum(dim=1)
-        w_rev_n = w_rev / (p_rev.unsqueeze(1) + 1e-8)
-        target_rev = torch.einsum("bk,bkd->bd", w_rev_n, x2_def_nbrs)
-        loss_rev = (p_rev * (x1 - target_rev).pow(2).sum(dim=1)).mean()
-    else:
-        target_rev = torch.einsum("bk,bkd->bd", w_rev, x2_def_nbrs)
-        loss_rev = (x1 - target_rev).pow(2).sum(dim=1).mean()
+    target_rev = torch.einsum("bk,bkd->bd", w_rev, x2_def_nbrs)
+    loss_rev = (x1 - target_rev).pow(2).sum(dim=1).mean()
 
     return loss_fwd + weight_rev * loss_rev
 
