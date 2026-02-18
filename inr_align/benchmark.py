@@ -447,11 +447,12 @@ def run_ours(
         gene_expr2_gt = _prepare_gene_expr(slice2, n_hvg=config.expr_field.n_hvg, device=device)
         if gene_expr2_gt is not None:
             n_genes = gene_expr2_gt.shape[1]
+            gd = config.gene_decoder
             gene_decoder = GeneDecoder(
                 emb_dim=emb_dim,
-                batch_dim=16,
-                hidden=256,
-                layers=2,
+                batch_dim=gd.batch_dim,
+                hidden=gd.hidden,
+                layers=gd.layers,
                 n_genes=n_genes,
                 n_slices=2,
             ).to(device)
@@ -487,7 +488,7 @@ def run_ours(
         # Denormalize
         coords2_def_denorm = coords2_def_norm * std + mean
         # Griddata resampling
-        grid_coords, valid_mask = griddata_resample(coords2_def_denorm, side_length=200)
+        grid_coords, valid_mask = griddata_resample(coords2_def_denorm, side_length=config.train.griddata_side_length)
         print(f"  Griddata: {coords2_def_denorm.shape[0]} → {grid_coords.shape[0]} points (grid)")
         coords2_final = coords2_def_denorm  # Keep original deformed coords for metrics
     else:

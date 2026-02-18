@@ -232,9 +232,10 @@ def align_pair(
         gene_expr2_gt = _prepare_gene_expr(src_slice, n_hvg=config.expr_field.n_hvg, device=device)
         if gene_expr2_gt is not None:
             n_genes = gene_expr2_gt.shape[1]
+            gd = config.gene_decoder
             gene_decoder = GeneDecoder(
-                emb_dim=emb_dim, batch_dim=16, hidden=256, layers=2,
-                n_genes=n_genes, n_slices=2,
+                emb_dim=emb_dim, batch_dim=gd.batch_dim, hidden=gd.hidden,
+                layers=gd.layers, n_genes=n_genes, n_slices=2,
             ).to(device)
             slice_ids2 = torch.ones(src_slice.shape[0], dtype=torch.long, device=device)
             print(f"  GeneDecoder: emb_dim={emb_dim}, n_genes={n_genes}")
@@ -259,7 +260,7 @@ def align_pair(
     if is_grid and config.train.use_griddata:
         x2_def = apply_model(model, x2, snap_to_grid=False)
         coords_def_denorm = denormalize_coordinates(x2_def.cpu().numpy(), mean, std)
-        grid_coords, valid_mask = griddata_resample(coords_def_denorm, side_length=200)
+        grid_coords, valid_mask = griddata_resample(coords_def_denorm, side_length=config.train.griddata_side_length)
         print(f"  Griddata: {coords_def_denorm.shape[0]} → {grid_coords.shape[0]} grid points")
         coords_final = coords_def_denorm  # Use deformed coords for downstream
     else:

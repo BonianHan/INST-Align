@@ -98,7 +98,6 @@ python -u run_test_acc.py \
     --train_topk 64 \
     --train_lr 0.001 \
     --train_weight_rev 1.0 \
-    --train_jacobian_samples 256 \
     --train_grad_clip 2.0 \
     --train_scheduler_patience 30 \
     --train_scheduler_factor 0.5 \
@@ -109,16 +108,10 @@ python -u run_test_acc.py \
     --icp_icp_max_iter 100 \
     \
     --expr_hidden 256 \
-    --expr_layers 4 \
     --expr_n_freqs 6 \
     --expr_max_freq_log2 5 \
     --expr_batch_emb_dim 16 \
     --expr_latent_dim 32 \
-    --expr_pretrain_epochs 300 \
-    --expr_pretrain_lr 0.001 \
-    --expr_pretrain_warmup 0.3 \
-    --expr_pretrain_batch_reg 0.01 \
-    --expr_lam_canonical 0.005 \
     --expr_norm_method per_gene \
     --expr_n_hvg 200 \
     \

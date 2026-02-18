@@ -61,14 +61,12 @@ def make_config(use_expr_inr: bool = False) -> PipelineConfig:
     config.model.layers = 6
     config.model.n_freqs = 6
 
-    config.use_expression_inr = use_expr_inr
+    config.use_expr_field = use_expr_inr
     if use_expr_inr:
-        config.expression_inr.hidden = 256
-        config.expression_inr.layers = 4
-        config.expression_inr.pretrain_epochs = 200
-        config.expression_inr.lam_recon = 0.1
-        config.expression_inr.finetune_lr_factor = 0.0
-        config.expression_inr.n_hvg = 200
+        config.expr_field.hidden = 256
+        config.expr_field.encoder_layers = 4
+        config.expr_field.lam_expr = 0.1
+        config.expr_field.n_hvg = 200
 
     return config
 

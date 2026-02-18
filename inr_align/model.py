@@ -1,7 +1,7 @@
 """Neural network components and rigid alignment (PCA + adaptive ICP).
 
 This module contains:
-- ``NerfiesPositionalEncoding``: windowed Fourier features (Nerfies).
+- ``WindowedPositionalEncoding``: windowed Fourier positional encoding.
 - ``DeformationNet``: residual MLP that predicts per-point displacements.
 - ``UnifiedCostMatcher``: adaptive-temperature soft-assignment matcher.
 - ``ExpressionINR``: implicit neural field for gene expression prediction (legacy).
@@ -21,14 +21,14 @@ import torch.nn.functional as F
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
-from inr_align.config import ExprFieldConfig, ExpressionINRConfig, ICPConfig, ModelConfig, MatcherConfig
+from inr_align.config import ExprFieldConfig, ICPConfig, ModelConfig, MatcherConfig
 
 # ============================================================================
 # Positional Encoding
 # ============================================================================
 
 
-class NerfiesPositionalEncoding(nn.Module):
+class WindowedPositionalEncoding(nn.Module):
     """Windowed Fourier positional encoding (Park et al., *Nerfies*, 2021).
 
     The coarse-to-fine *alpha* window lets the network learn from low
@@ -104,7 +104,7 @@ class DeformationNet(nn.Module):
         if config is None:
             config = ModelConfig()
 
-        self.encoder = NerfiesPositionalEncoding(config.d, config.n_freqs, config.max_freq_log2)
+        self.encoder = WindowedPositionalEncoding(config.d, config.n_freqs, config.max_freq_log2)
         self.n_freqs = config.n_freqs
         self.emb_dim = emb_dim
         self.grid_mode = grid_mode
@@ -384,7 +384,7 @@ class ExpressionINR(nn.Module):
     """Implicit neural representation for spatial gene expression fields.
 
     Maps 2D spatial coordinates to predicted HVG gene expression values.
-    Uses the same ``NerfiesPositionalEncoding`` as ``DeformationNet``.
+    Uses the same ``WindowedPositionalEncoding`` as ``DeformationNet``.
 
     Architecture::
 
@@ -395,19 +395,19 @@ class ExpressionINR(nn.Module):
         n_genes: Number of output genes (determined at runtime).
     """
 
-    def __init__(self, config: Optional[ExpressionINRConfig] = None, n_genes: int = 200):
+    def __init__(self, config: Optional[ExprFieldConfig] = None, n_genes: int = 200):
         super().__init__()
         if config is None:
-            config = ExpressionINRConfig()
+            config = ExprFieldConfig()
 
-        self.encoder = NerfiesPositionalEncoding(2, config.n_freqs, config.max_freq_log2)
+        self.encoder = WindowedPositionalEncoding(2, config.n_freqs, config.max_freq_log2)
         self.n_freqs = config.n_freqs
         self.n_genes = n_genes
 
         # Build MLP
         net = []
         in_dim = self.encoder.d_out
-        for i in range(config.layers - 1):
+        for i in range(config.encoder_layers):
             net.append(nn.Linear(in_dim if i == 0 else config.hidden, config.hidden))
             net.append(nn.ReLU())
         net.append(nn.Linear(config.hidden, n_genes))
@@ -471,7 +471,7 @@ class ExprField(nn.Module):
         if config is None:
             config = ExprFieldConfig()
 
-        self.encoder = NerfiesPositionalEncoding(2, config.n_freqs, config.max_freq_log2)
+        self.encoder = WindowedPositionalEncoding(2, config.n_freqs, config.max_freq_log2)
         self.n_freqs = config.n_freqs
         self.n_genes = n_genes
         self.batch_emb_dim = config.batch_emb_dim
@@ -597,33 +597,37 @@ def pretrain_expression_inr(
     expr_inr: ExpressionINR,
     coords: torch.Tensor,
     expression: torch.Tensor,
-    config: Optional[ExpressionINRConfig] = None,
+    *,
+    lr: float = 1e-3,
+    epochs: int = 300,
+    warmup_fraction: float = 0.3,
+    print_every: int = 50,
 ) -> ExpressionINR:
-    """Pre-train the ExpressionINR on target-slice expression.
+    """Pre-train the ExpressionINR on target-slice expression (legacy).
 
     Learns the mapping ``coords → expression`` using MSE loss with
-    Nerfies-style coarse-to-fine alpha scheduling.
+    coarse-to-fine alpha scheduling.
 
     Args:
         expr_inr: ``ExpressionINR`` model (on device).
         coords: ``(N, 2)`` target coordinates (normalized, on device).
         expression: ``(N, G)`` target HVG expression (normalized, on device).
-        config: Expression INR hyper-parameters.
+        lr: Learning rate.
+        epochs: Number of pre-training epochs.
+        warmup_fraction: Fraction of epochs for coarse-to-fine warmup.
+        print_every: Print interval.
 
     Returns:
         Trained ``ExpressionINR`` with best checkpoint restored.
     """
-    if config is None:
-        config = ExpressionINRConfig()
-
-    optimizer = torch.optim.Adam(expr_inr.parameters(), lr=config.pretrain_lr)
+    optimizer = torch.optim.Adam(expr_inr.parameters(), lr=lr)
     n_freqs = expr_inr.n_freqs
     best_loss = float("inf")
     best_state = None
     start = time.time()
 
-    for ep in range(config.pretrain_epochs):
-        warmup = int(config.pretrain_epochs * config.pretrain_warmup)
+    for ep in range(epochs):
+        warmup = int(epochs * warmup_fraction)
         alpha = n_freqs * (ep / warmup) if ep < warmup else float(n_freqs)
         alpha_t = torch.tensor(alpha, device=coords.device)
 
@@ -637,7 +641,7 @@ def pretrain_expression_inr(
             best_loss = loss.item()
             best_state = {k: v.cpu().clone() for k, v in expr_inr.state_dict().items()}
 
-        if ep % config.pretrain_print_every == 0 or ep == config.pretrain_epochs - 1:
+        if ep % print_every == 0 or ep == epochs - 1:
             # R-squared
             with torch.no_grad():
                 ss_res = (expression - pred).pow(2).sum()

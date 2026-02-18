@@ -73,6 +73,7 @@ class TrainConfig:
     snap_to_grid_training: bool = False  # Snap during training (non-differentiable; usually False)
     snap_to_grid_inference: bool = True  # Snap final coordinates for grid datasets
     use_griddata: bool = True      # Use griddata resampling instead of snap_to_grid
+    griddata_side_length: int = 200  # Grid side length for griddata resampling
 
 
 # ============================================================================
@@ -110,8 +111,17 @@ class ExprFieldConfig:
     n_hvg: int = 2000
 
 
-# Keep ExpressionINRConfig as alias for backward compatibility
-ExpressionINRConfig = ExprFieldConfig
+# ============================================================================
+# Gene Decoder
+# ============================================================================
+
+@dataclass
+class GeneDecoderConfig:
+    """GeneDecoder architecture (embedding → gene expression)."""
+
+    batch_dim: int = 16       # Per-slice batch embedding dimension
+    hidden: int = 256         # Hidden layer width
+    layers: int = 2           # Number of hidden layers
 
 
 # ============================================================================
@@ -162,6 +172,7 @@ class PipelineConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     icp: ICPConfig = field(default_factory=ICPConfig)
     expr_field: ExprFieldConfig = field(default_factory=ExprFieldConfig)
+    gene_decoder: GeneDecoderConfig = field(default_factory=GeneDecoderConfig)
     use_expr_field: bool = False  # Enable expression field for joint training
 
 
@@ -209,8 +220,9 @@ def add_pipeline_args(parser: argparse.ArgumentParser) -> None:
         --matcher_tau_init, ...           (MatcherConfig)
         --train_epochs, ...               (TrainConfig)
         --icp_mode, ...                   (ICPConfig)
-        --expr_hidden, ...                (ExpressionINRConfig)
-        --use_expr_inr                    (flag)
+        --expr_hidden, ...                (ExprFieldConfig)
+        --gdec_batch_dim, ...             (GeneDecoderConfig)
+        --use_expr_field                  (flag)
     """
     # Top-level PipelineConfig scalars
     g = parser.add_argument_group("Pipeline")
@@ -240,6 +252,9 @@ def add_pipeline_args(parser: argparse.ArgumentParser) -> None:
     g = parser.add_argument_group("Expression Field")
     _add_dataclass_args(g, ExprFieldConfig, prefix="expr_")
 
+    g = parser.add_argument_group("Gene Decoder")
+    _add_dataclass_args(g, GeneDecoderConfig, prefix="gdec_")
+
 
 def config_from_args(args: argparse.Namespace) -> PipelineConfig:
     """Build a PipelineConfig from a parsed argparse namespace."""
@@ -258,6 +273,7 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
     _set_dataclass_from_args(config.train, args, prefix="train_")
     _set_dataclass_from_args(config.icp, args, prefix="icp_")
     _set_dataclass_from_args(config.expr_field, args, prefix="expr_")
+    _set_dataclass_from_args(config.gene_decoder, args, prefix="gdec_")
     return config
 
 
@@ -295,6 +311,7 @@ def print_config(config: PipelineConfig) -> None:
     _print_section("Training", config.train, default.train)
     _print_section("ICP", config.icp, default.icp)
     _print_section("Expression Field", config.expr_field, default.expr_field)
+    _print_section("Gene Decoder", config.gene_decoder, default.gene_decoder)
     print("\n" + "=" * 60)
     print("  (* = non-default)")
     print("=" * 60)
