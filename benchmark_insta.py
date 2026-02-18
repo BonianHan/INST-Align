@@ -39,6 +39,7 @@ from inr_align.benchmark import (
     plot_comparison,
 )
 from inr_align.config import DLPFC_SAMPLE_GROUPS, PipelineConfig
+from inr_align.model1 import JointConfig
 
 
 # ============================================================================
@@ -113,6 +114,14 @@ def main():
     parser.add_argument("--no_stalign", action="store_true")
     parser.add_argument("--sample_groups", type=int, nargs="+", default=[0],
                         help="Which DLPFC sample groups to run (0-indexed). Default: [0] = sample1 only")
+    parser.add_argument("--joint", action="store_true",
+                        help="Also run INSTA-Joint (Encoder+Decoder+Discriminator architecture)")
+    parser.add_argument("--joint_lam_adv", type=float, default=0.1,
+                        help="Joint: adversarial loss weight")
+    parser.add_argument("--joint_lam_recon", type=float, default=1.0,
+                        help="Joint: reconstruction loss weight")
+    parser.add_argument("--joint_emb_dim", type=int, default=64,
+                        help="Joint: encoder embedding dimension")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -123,6 +132,15 @@ def main():
     config.train.lam_jacobian = 0.1
     config.train.warmup_fraction = 0.3
     config.icp.mode = "icp_only"
+
+    # Joint config
+    jcfg = None
+    if args.joint:
+        jcfg = JointConfig(
+            emb_dim=args.joint_emb_dim,
+            lam_adv=args.joint_lam_adv,
+            lam_recon=args.joint_lam_recon,
+        )
 
     # ================================================================
     # Part 1: Alignment Benchmark (4 metrics: OT, NN, Ratio, CLC)
@@ -158,6 +176,8 @@ def main():
         run_stalign=not args.no_stalign,
         sample_id_groups=sample_id_groups,
         dataset_folders=dataset_folders,
+        run_joint=args.joint,
+        joint_config=jcfg,
     )
 
     # Add Dataset column

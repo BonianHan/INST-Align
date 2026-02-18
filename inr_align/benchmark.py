@@ -53,6 +53,8 @@ from inr_align.model import (
 )
 from inr_align.train import apply_model, train
 from inr_align.utils import detect_grid_spacing, normalize_coordinates
+from inr_align.loss1 import align_pair_joint
+from inr_align.model1 import JointConfig
 
 
 # ============================================================================
@@ -409,6 +411,25 @@ def run_ours(
     return coords2_rigid_denorm, coords2_final, elapsed
 
 
+def run_ours_joint(
+    slice1,
+    slice2,
+    config: PipelineConfig,
+    jcfg: Optional[JointConfig] = None,
+    device: str = "cuda",
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Our method with decoupled joint architecture (Encoder+Decoder+Discriminator).
+
+    Drop-in replacement for ``run_ours`` using the new joint training loop.
+
+    Returns:
+        ``(coords2_rigid_denorm, coords2_final, elapsed_time)``.
+    """
+    if jcfg is None:
+        jcfg = JointConfig()
+    return align_pair_joint(slice1, slice2, config, jcfg, device)
+
+
 # ============================================================================
 # Full benchmark
 # ============================================================================
@@ -426,6 +447,8 @@ def benchmark_all(
     run_stalign: bool = True,
     sample_id_groups: Optional[List[List[str]]] = None,
     dataset_folders: Optional[List[str]] = None,
+    run_joint: bool = False,
+    joint_config: Optional[JointConfig] = None,
 ) -> pd.DataFrame:
     """Run all methods on all sample groups.
 
@@ -553,6 +576,20 @@ def benchmark_all(
                 print(f"  Ours failed: {e}")
                 import traceback
                 traceback.print_exc()
+
+            # --- Ours (Joint: Encoder + Decoder + Discriminator) ---
+            if run_joint:
+                try:
+                    jcfg = joint_config if joint_config is not None else JointConfig()
+                    c2_rigid_j, c2_final_j, t_j = run_ours_joint(
+                        s1.copy(), s2.copy(), config, jcfg, device,
+                    )
+                    rows.append(_make_row("INSTA-Joint-Rigid", t_j, c2_rigid_j))
+                    rows.append(_make_row("INSTA-Joint-Nonrigid", t_j, c2_final_j))
+                except Exception as e:
+                    print(f"  Ours (Joint) failed: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     return pd.DataFrame(rows)
 
