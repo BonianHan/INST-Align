@@ -40,7 +40,7 @@ from inr_align.model import (
     normalize_expression,
 )
 from inr_align.train import TrainResult, apply_model, train
-from inr_align.utils import detect_grid_spacing, denormalize_coordinates, griddata_resample, normalize_coordinates
+from inr_align.utils import detect_grid_spacing, denormalize_coordinates, normalize_coordinates
 
 
 # ============================================================================
@@ -210,9 +210,6 @@ def align_pair(
     model = DeformationNet(
         config.model,
         emb_dim=emb_dim,
-        grid_mode=is_grid,
-        grid_spacing=[grid_info["spacing_x"], grid_info["spacing_y"]] if is_grid else None,
-        grid_origin=grid_info["origin"],
     ).to(device)
 
     matcher = UnifiedCostMatcher(config.matcher)
@@ -256,17 +253,8 @@ def align_pair(
 
     model.eval()
 
-    # Post-processing: griddata for grid data, raw deformed coords otherwise
-    if is_grid and config.train.use_griddata:
-        x2_def = apply_model(model, x2, snap_to_grid=False)
-        coords_def_denorm = denormalize_coordinates(x2_def.cpu().numpy(), mean, std)
-        grid_coords, valid_mask = griddata_resample(coords_def_denorm, side_length=config.train.griddata_side_length)
-        print(f"  Griddata: {coords_def_denorm.shape[0]} → {grid_coords.shape[0]} grid points")
-        coords_final = coords_def_denorm  # Use deformed coords for downstream
-    else:
-        use_snap = bool(is_grid and config.train.snap_to_grid_inference)
-        x2_def = apply_model(model, x2, snap_to_grid=use_snap)
-        coords_final = denormalize_coordinates(x2_def.cpu().numpy(), mean, std)
+    x2_def = apply_model(model, x2)
+    coords_final = denormalize_coordinates(x2_def.cpu().numpy(), mean, std)
 
     return coords_final, result
 
@@ -387,9 +375,6 @@ def save_inr_results(
 ) -> str:
     """Save per-slice h5ad files with INR-aligned coordinates.
 
-    Each h5ad file retains original ``spatial`` (X, Y) and adds
-    ``inr_X``, ``inr_Y`` columns in ``.obs`` with the aligned coordinates.
-
     Output directory: ``inr_align/inr/result/{dataset}/``
 
     Returns:
@@ -401,7 +386,6 @@ def save_inr_results(
     for i, (adata, name) in enumerate(zip(aligned_slices, slice_names)):
         out = adata.copy()
 
-        # Aligned coordinates
         if "spatial_aligned" in out.obsm:
             aligned_coords = out.obsm["spatial_aligned"]
         else:

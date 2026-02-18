@@ -44,7 +44,6 @@ class MatcherConfig:
     tau_max: float = 1.0
     lambda_feat: float = 1.0
     ema_decay: float = 0.9
-    sinkhorn_iters: int = 0  # 0 = softmax (default), >0 = Sinkhorn normalization iterations
 
 
 # ============================================================================
@@ -61,7 +60,8 @@ class TrainConfig:
     lr: float = 1e-3
     weight_rev: float = 1.0
     lam_jacobian: float = 0.015
-    lam_divergence: float = 10.0   # Divergence penalty — prevents global compression (0 = off)
+    full_reverse_interval: int = 1  # Full-coverage reverse loss every N epochs (0 = off)
+    lam_uniqueness: float = 0.1   # Assignment uniqueness loss weight (0 = off)
     lam_kl: float = 1.0           # Splane embedding KL loss weight (0 = off)
     lam_recon: float = 0.5        # Gene reconstruction loss weight (0 = off)
     grad_clip: float = 1.0
@@ -70,10 +70,6 @@ class TrainConfig:
     scheduler_patience: int = 50   # ReduceLROnPlateau: epochs without improvement before LR drop
     scheduler_factor: float = 0.5  # LR multiplied by this factor on plateau
     scheduler_min_lr: float = 1e-6 # minimum LR floor
-    snap_to_grid_training: bool = False  # Snap during training (non-differentiable; usually False)
-    snap_to_grid_inference: bool = True  # Snap final coordinates for grid datasets
-    use_griddata: bool = True      # Use griddata resampling instead of snap_to_grid
-    griddata_side_length: int = 200  # Grid side length for griddata resampling
 
 
 # ============================================================================

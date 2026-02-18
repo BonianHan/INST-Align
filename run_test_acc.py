@@ -72,12 +72,12 @@ ALL_DATASETS = list(SLICE_ORDER.keys())
 # later warmup so coarse-to-fine PE has more time to ramp up
 # ---------------------------------------------------------------------------
 DATASET_OVERRIDES = {
-    # DLPFC (grid): strong Jacobian + divergence anti-collapse
-    "DLPFC": {"lam_jacobian": 0.1, "warmup_fraction": 0.3, "lam_divergence": 10.0},
+    # DLPFC (grid): strong Jacobian (no uniqueness for grid)
+    "DLPFC": {"lam_jacobian": 0.1, "warmup_fraction": 0.3, "lam_uniqueness": 0.0},
     # Non-grid datasets: weaker Jacobian, delayed warmup
-    "STARMap": {"lam_jacobian": 0.01, "warmup_fraction": 0.4},
-    "BaristaSeq": {"lam_jacobian": 0.01, "warmup_fraction": 0.4},
-    "MERFISH": {"lam_jacobian": 0.001, "warmup_fraction": 0.4},
+    "STARMap": {"lam_jacobian": 0.01, "warmup_fraction": 0.4, "lam_uniqueness": 0.1},
+    "BaristaSeq": {"lam_jacobian": 0.01, "warmup_fraction": 0.4, "lam_uniqueness": 0.1},
+    "MERFISH": {"lam_jacobian": 0.001, "warmup_fraction": 0.4, "lam_uniqueness": 0.1},
 }
 
 
@@ -105,10 +105,6 @@ def _config_for_dataset(config: PipelineConfig, dataset: str) -> PipelineConfig:
 def save_results(df_all: pd.DataFrame, output_dir: str = ".") -> None:
     """Save per-pair CSV, summary CSV, and plot."""
 
-    has_nn = "Accuracy_NN" in df_all.columns
-    has_ratio = "Ratio" in df_all.columns
-    has_clc = "CLC" in df_all.columns
-
     # ---- Per-pair results ----
     csv_path = os.path.join(output_dir, "benchmark_results.csv")
     df_all.to_csv(csv_path, index=False)
@@ -118,14 +114,13 @@ def save_results(df_all: pd.DataFrame, output_dir: str = ".") -> None:
     summary_rows = []
     methods = df_all["Method"].unique()
 
-    # Metrics to summarize
-    metric_cols = [("Accuracy", "OT")]
-    if has_nn:
-        metric_cols.append(("Accuracy_NN", "NN"))
-    if has_ratio:
-        metric_cols.append(("Ratio", "Ratio"))
-    if has_clc:
-        metric_cols.append(("CLC", "CLC"))
+    # Metrics to summarize (auto-detect from DataFrame)
+    all_metric_defs = [
+        ("Accuracy", "OT"), ("Accuracy_NN", "NN"), ("Ratio", "Ratio"),
+        ("CLC", "CLC"), ("LISI", "LISI"), ("Silhouette", "Silh"),
+        ("Chamfer", "Chamfer"),
+    ]
+    metric_cols = [(col, suffix) for col, suffix in all_metric_defs if col in df_all.columns]
 
     def _add_method_stats(row, df_sub, methods, metric_col, suffix):
         """Add mean/std for each method to row dict."""

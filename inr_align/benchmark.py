@@ -1,9 +1,14 @@
 """Multi-method benchmark: PASTE / Spateo / SPACEL / STalign / Ours / No-align.
 
-Compares all methods on the same dataset using two accuracy metrics:
+Compares all methods on the same dataset using seven metrics:
 
 1. **OT Accuracy** — PASTE-style transport-plan weighted label match.
 2. **NN Accuracy** — Bidirectional nearest-neighbour label match (iSTBench-style).
+3. **Ratio** — Many-to-one collapse measure.
+4. **CLC** — Contextual Label Consistency.
+5. **LISI** — Local Inverse Simpson's Index (domain consistency).
+6. **Silhouette** — Domain separation in aligned space.
+7. **Chamfer** — Symmetric Chamfer distance (geometric alignment).
 
 Run directly::
 
@@ -32,13 +37,22 @@ import scipy.sparse
 
 from inr_align.config import DLPFC_SAMPLE_GROUPS, PipelineConfig
 from inr_align.loss import compute_P_matrix
-from inr_align.metrics import calculate_clc, coords_to_pi, mapping_accuracy_nn_bidi, mapping_accuracy_paste, sparse_P_to_dense_pi
+from inr_align.metrics import (
+    calculate_clc,
+    chamfer_distance,
+    compute_lisi,
+    compute_silhouette,
+    coords_to_pi,
+    mapping_accuracy_nn_bidi,
+    mapping_accuracy_paste,
+    sparse_P_to_dense_pi,
+)
 from inr_align.model import (
     DeformationNet, GeneDecoder, UnifiedCostMatcher, adaptive_icp,
     normalize_expression, ExprField,
 )
 from inr_align.train import apply_model, train
-from inr_align.utils import detect_grid_spacing, griddata_resample, normalize_coordinates
+from inr_align.utils import detect_grid_spacing, normalize_coordinates
 
 
 # ============================================================================
@@ -49,48 +63,20 @@ DLPFC_LABEL_MAP = {"L1": 1, "L2": 2, "L3": 3, "L4": 4, "L5": 5, "L6": 6, "WM": 7
 
 
 # ============================================================================
-# Individual method runners
+# Individual method runners — return aligned coordinates + time
 # ============================================================================
-
-
-def run_no_align_baseline(
-    slice1,
-    slice2,
-    label_key: str = "original_domain",
-    label_map: Optional[Dict] = None,
-) -> Tuple[float, float, float, float, float]:
-    """No alignment — raw spatial coordinates → OT pi → accuracy.
-
-    Returns:
-        ``(acc_ot, acc_nn, ratio, clc, elapsed_time)``.
-    """
-    start = time.time()
-    coords1 = slice1.obsm["spatial"]
-    coords2 = slice2.obsm["spatial"]
-    pi = coords_to_pi(coords1, coords2)
-    elapsed = time.time() - start
-
-    labels1 = slice1.obs[label_key]
-    labels2 = slice2.obs[label_key]
-    l1 = np.asarray(labels1)
-    l2 = np.asarray(labels2)
-    acc_ot = mapping_accuracy_paste(labels1, labels2, pi, label_map)
-    acc_nn, ratio = mapping_accuracy_nn_bidi(l1, l2, coords1, coords2)
-    clc = calculate_clc(l1, l2, coords1, coords2)
-    return acc_ot, acc_nn, ratio, clc, elapsed
 
 
 def run_paste_baseline(
     slice1,
     slice2,
     alpha: float = 0.1,
-    label_key: str = "original_domain",
-    label_map: Optional[Dict] = None,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[np.ndarray, float]:
     """PASTE pairwise alignment.
 
     Returns:
-        ``(acc_ot, acc_nn, ratio, clc, elapsed_time)``.
+        ``(pi, elapsed_time)``.  PASTE produces a transport plan,
+        not explicit aligned coordinates.
     """
     import paste as pst
 
@@ -104,32 +90,18 @@ def run_paste_baseline(
         use_gpu=True, backend=ot.backend.TorchBackend(),
     )
     elapsed = time.time() - start
-
-    labels1 = slice1.obs[label_key]
-    labels2 = slice2.obs[label_key]
-    l1 = np.asarray(labels1)
-    l2 = np.asarray(labels2)
-    acc_ot = mapping_accuracy_paste(labels1, labels2, pi, label_map)
-
-    # PASTE aligns via pi, not explicit coordinates; use original coords for NN/CLC
-    coords1 = slice1.obsm["spatial"]
-    coords2 = slice2.obsm["spatial"]
-    acc_nn, ratio = mapping_accuracy_nn_bidi(l1, l2, coords1, coords2)
-    clc = calculate_clc(l1, l2, coords1, coords2)
-    return acc_ot, acc_nn, ratio, clc, elapsed
+    return pi, elapsed
 
 
 def run_spateo_baseline(
     slice1,
     slice2,
     device: str = "cuda",
-    label_key: str = "original_domain",
-    label_map: Optional[Dict] = None,
-) -> Tuple[Tuple[float, float, float, float], Tuple[float, float, float, float], float]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Spateo morpho_align (rigid + nonrigid).
 
     Returns:
-        ``((acc_ot, acc_nn, ratio, clc), (acc_ot, acc_nn, ratio, clc), elapsed_time)``.
+        ``(target_coords, coords_rigid, coords_nonrigid, elapsed_time)``.
     """
     s1 = slice1.copy()
     s2 = slice2.copy()
@@ -145,37 +117,18 @@ def run_spateo_baseline(
     )
     elapsed = time.time() - start
 
-    # aligned_slices[1] is the aligned source
+    target_coords = aligned_slices[0].obsm["align_spatial"]
     coords_rigid = aligned_slices[1].obsm["align_spatial_rigid"]
     coords_nonrigid = aligned_slices[1].obsm["align_spatial_nonrigid"]
-    target_coords = aligned_slices[0].obsm["align_spatial"]
 
-    pi_rigid = coords_to_pi(target_coords, coords_rigid)
-    pi_nonrigid = coords_to_pi(target_coords, coords_nonrigid)
-
-    labels1 = slice1.obs[label_key]
-    labels2 = slice2.obs[label_key]
-    l1 = np.asarray(labels1)
-    l2 = np.asarray(labels2)
-
-    acc_rigid_ot = mapping_accuracy_paste(labels1, labels2, pi_rigid, label_map)
-    acc_nonrigid_ot = mapping_accuracy_paste(labels1, labels2, pi_nonrigid, label_map)
-
-    acc_rigid_nn, ratio_rigid = mapping_accuracy_nn_bidi(l1, l2, target_coords, coords_rigid)
-    acc_nonrigid_nn, ratio_nonrigid = mapping_accuracy_nn_bidi(l1, l2, target_coords, coords_nonrigid)
-
-    clc_rigid = calculate_clc(l1, l2, target_coords, coords_rigid)
-    clc_nonrigid = calculate_clc(l1, l2, target_coords, coords_nonrigid)
-
-    return (acc_rigid_ot, acc_rigid_nn, ratio_rigid, clc_rigid), (acc_nonrigid_ot, acc_nonrigid_nn, ratio_nonrigid, clc_nonrigid), elapsed
+    return target_coords, coords_rigid, coords_nonrigid, elapsed
 
 
 def run_spacel_baseline(
     slice1,
     slice2,
     label_key: str = "original_domain",
-    label_map: Optional[Dict] = None,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """SPACEL Scube.align (graph-based alignment).
 
     Runs in a separate ``spacel`` conda environment via subprocess,
@@ -183,7 +136,7 @@ def run_spacel_baseline(
     the main environment.
 
     Returns:
-        ``(acc_ot, acc_nn, ratio, clc, elapsed_time)``.
+        ``(coords1_aligned, coords2_aligned, elapsed_time)``.
     """
     import os
     import subprocess
@@ -219,18 +172,7 @@ def run_spacel_baseline(
         coords2 = data["coords2"]
         elapsed = float(data["elapsed"])
 
-    pi = coords_to_pi(coords1, coords2)
-
-    labels1 = slice1.obs[label_key]
-    labels2 = slice2.obs[label_key]
-    l1 = np.asarray(labels1)
-    l2 = np.asarray(labels2)
-
-    acc_ot = mapping_accuracy_paste(labels1, labels2, pi, label_map)
-    acc_nn, ratio = mapping_accuracy_nn_bidi(l1, l2, coords1, coords2)
-    clc = calculate_clc(l1, l2, coords1, coords2)
-
-    return acc_ot, acc_nn, ratio, clc, elapsed
+    return coords1, coords2, elapsed
 
 
 def run_stalign_baseline(
@@ -238,13 +180,11 @@ def run_stalign_baseline(
     slice2,
     device: str = "cuda",
     dx: int = 30,
-    label_key: str = "original_domain",
-    label_map: Optional[Dict] = None,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[np.ndarray, float]:
     """STalign LDDMM diffeomorphic registration.
 
     Returns:
-        ``(acc_ot, acc_nn, ratio, clc, elapsed_time)``.
+        ``(coords2_aligned, elapsed_time)``.
     """
     from STalign import STalign as STalign_module
 
@@ -274,19 +214,7 @@ def run_stalign_baseline(
     elapsed = time.time() - start
 
     coords2_aligned = tpointsI[:, [1, 0]].numpy()
-
-    pi = coords_to_pi(coords1, coords2_aligned)
-
-    labels1 = slice1.obs[label_key]
-    labels2 = slice2.obs[label_key]
-    l1 = np.asarray(labels1)
-    l2 = np.asarray(labels2)
-
-    acc_ot = mapping_accuracy_paste(labels1, labels2, pi, label_map)
-    acc_nn, ratio = mapping_accuracy_nn_bidi(l1, l2, coords1, coords2_aligned)
-    clc = calculate_clc(l1, l2, coords1, coords2_aligned)
-
-    return acc_ot, acc_nn, ratio, clc, elapsed
+    return coords2_aligned, elapsed
 
 
 def _load_splane_embeddings(
@@ -358,22 +286,14 @@ def run_ours(
     config: PipelineConfig,
     device: str = "cuda",
     label_key: str = "original_domain",
-    label_map: Optional[Dict] = None,
     splane_emb2_np: Optional[np.ndarray] = None,
     dataset_folder: str = "DLPFC_sample1",
     sample_id2: Optional[str] = None,
-) -> Tuple[Tuple[float, float, float, float], Tuple[float, float, float, float], float]:
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """Our method: adaptive_icp + INR deformation.
 
-    Now supports:
-    - Embedding head (DeformationNet outputs coords + emb_dim-d embedding)
-    - Splane KL loss (emb_head → Splane target)
-    - Gene reconstruction (GeneDecoder: emb + batch → gene expression)
-    - Divergence loss (anti-compression)
-    - Griddata post-processing (replaces snap_to_grid)
-
     Returns:
-        ``((acc_ot, acc_nn, ratio, clc), (acc_ot, acc_nn, ratio, clc), elapsed_time)``.
+        ``(coords2_rigid_denorm, coords2_final, elapsed_time)``.
     """
     # Preprocessing
     for ad_ in [slice1, slice2]:
@@ -432,9 +352,6 @@ def run_ours(
     model = DeformationNet(
         config.model,
         emb_dim=emb_dim,
-        grid_mode=is_grid,
-        grid_spacing=[spacing_x, spacing_y] if is_grid else None,
-        grid_origin=origin,
     ).to(device)
 
     matcher = UnifiedCostMatcher(config.matcher)
@@ -481,46 +398,15 @@ def run_ours(
     # Apply deformation
     model.eval()
 
-    # Use griddata for grid datasets (replaces snap_to_grid)
-    if is_grid and config.train.use_griddata:
-        x2_def = apply_model(model, x2, snap_to_grid=False)
-        coords2_def_norm = x2_def.cpu().numpy()
-        # Denormalize
-        coords2_def_denorm = coords2_def_norm * std + mean
-        # Griddata resampling
-        grid_coords, valid_mask = griddata_resample(coords2_def_denorm, side_length=config.train.griddata_side_length)
-        print(f"  Griddata: {coords2_def_denorm.shape[0]} → {grid_coords.shape[0]} points (grid)")
-        coords2_final = coords2_def_denorm  # Keep original deformed coords for metrics
-    else:
-        x2_def = apply_model(model, x2, snap_to_grid=False)
-        coords2_final = x2_def.cpu().numpy() * std + mean
+    # Apply deformation and denormalize
+    x2_def = apply_model(model, x2)
+    coords2_final = x2_def.cpu().numpy() * std + mean
 
     coords2_rigid_denorm = coords2_rigid * std + mean
 
     elapsed = time.time() - start
 
-    # PI matrices
-    # 1. Rigid: spatial EMD
-    pi_rigid = coords_to_pi(coords1, coords2_rigid_denorm)
-
-    # 2. Spatial-only: spatial EMD after deformation
-    pi_spatial = coords_to_pi(coords1, coords2_final)
-
-    labels1 = slice1.obs[label_key]
-    labels2 = slice2.obs[label_key]
-    l1 = np.asarray(labels1)
-    l2 = np.asarray(labels2)
-
-    acc_rigid_ot = mapping_accuracy_paste(labels1, labels2, pi_rigid, label_map)
-    acc_spatial_ot = mapping_accuracy_paste(labels1, labels2, pi_spatial, label_map)
-
-    acc_rigid_nn, ratio_rigid = mapping_accuracy_nn_bidi(l1, l2, coords1, coords2_rigid_denorm)
-    acc_spatial_nn, ratio_spatial = mapping_accuracy_nn_bidi(l1, l2, coords1, coords2_final)
-
-    clc_rigid = calculate_clc(l1, l2, coords1, coords2_rigid_denorm)
-    clc_spatial = calculate_clc(l1, l2, coords1, coords2_final)
-
-    return (acc_rigid_ot, acc_rigid_nn, ratio_rigid, clc_rigid), (acc_spatial_ot, acc_spatial_nn, ratio_spatial, clc_spatial), elapsed
+    return coords2_rigid_denorm, coords2_final, elapsed
 
 
 # ============================================================================
@@ -549,7 +435,7 @@ def benchmark_all(
         config: Pipeline config (for our method's hyper-parameters).
         device: CUDA or CPU.
         label_key: Label column name.
-        label_map: Optional label → int mapping for accuracy.
+        label_map: Optional label -> int mapping for accuracy.
             ``None`` uses generic label equality.
         run_paste: Whether to include PASTE baseline.
         run_spateo: Whether to include Spateo baseline.
@@ -561,10 +447,8 @@ def benchmark_all(
             (e.g. ``"DLPFC_sample1"``) for group *j*.
 
     Returns:
-        DataFrame with columns ``[Sample, Pair, Method, Time, Accuracy, Accuracy_NN, Ratio, CLC]``.
-        ``Accuracy`` is OT-based (PASTE-style), ``Accuracy_NN`` is bidirectional NN,
-        ``Ratio`` is ``abs(log2(min(N1,N2)/n_unique))`` measuring collapse,
-        ``CLC`` is Contextual Label Consistency.
+        DataFrame with columns ``[Sample, Pair, Method, Time, Accuracy,
+        Accuracy_NN, Ratio, CLC, LISI, Silhouette, Chamfer]``.
     """
     if config is None:
         config = PipelineConfig()
@@ -585,16 +469,24 @@ def benchmark_all(
             _l1 = np.asarray(s1.obs[label_key])
             _l2 = np.asarray(s2.obs[label_key])
 
-            def _make_row(method, t, c2_aligned):
-                """Compute all 4 metrics and build result row."""
-                pi = coords_to_pi(_coords1, c2_aligned)
+            def _make_row(method, t, c2_aligned, c1_ref=None):
+                """Compute all 7 metrics and build result row."""
+                c1 = c1_ref if c1_ref is not None else _coords1
+                pi = coords_to_pi(c1, c2_aligned)
                 acc_ot = mapping_accuracy_paste(s1.obs[label_key], s2.obs[label_key], pi, label_map)
-                acc_nn, ratio = mapping_accuracy_nn_bidi(_l1, _l2, _coords1, c2_aligned)
-                clc = calculate_clc(_l1, _l2, _coords1, c2_aligned)
-                row = {"Sample": j, "Pair": i, "Method": method, "Time": t,
-                       "Accuracy": acc_ot, "Accuracy_NN": acc_nn, "Ratio": ratio,
-                       "CLC": clc}
-                print(f"  {method:16s} OT={acc_ot:.4f}  NN={acc_nn:.4f}  Ratio={ratio:.4f}  CLC={clc:.4f}")
+                acc_nn, ratio = mapping_accuracy_nn_bidi(_l1, _l2, c1, c2_aligned)
+                clc_val = calculate_clc(_l1, _l2, c1, c2_aligned)
+                lisi = compute_lisi(c1, c2_aligned, _l1, _l2)
+                sil = compute_silhouette(c1, c2_aligned, _l1, _l2)
+                cham = chamfer_distance(c1, c2_aligned)
+                row = {
+                    "Sample": j, "Pair": i, "Method": method, "Time": t,
+                    "Accuracy": acc_ot, "Accuracy_NN": acc_nn, "Ratio": ratio,
+                    "CLC": clc_val, "LISI": lisi, "Silhouette": sil, "Chamfer": cham,
+                }
+                print(f"  {method:16s} OT={acc_ot:.4f}  NN={acc_nn:.4f}  "
+                      f"Rat={ratio:.4f}  CLC={clc_val:.4f}  "
+                      f"LISI={lisi:.3f}  Sil={sil:.4f}  Cham={cham:.4f}")
                 return row
 
             # --- No-align ---
@@ -603,10 +495,13 @@ def benchmark_all(
             # --- PASTE ---
             if run_paste:
                 try:
-                    acc_ot_p, acc_nn_p, ratio_p, clc_p, t_p = run_paste_baseline(s1.copy(), s2.copy(), alpha=0.1, label_key=label_key, label_map=label_map)
-                    # PASTE has no explicit aligned coords; use its own pi-based OT, but NN/Ratio/CLC from original coords
+                    pi_paste, t_p = run_paste_baseline(s1.copy(), s2.copy(), alpha=0.1)
+                    # PASTE has no explicit aligned coords; compute NN metrics on original
                     row_p = _make_row("PASTE", t_p, _coords2)
-                    row_p["Accuracy"] = acc_ot_p  # Override OT acc with PASTE's pi-based value
+                    # Override OT accuracy with PASTE's pi-based value
+                    row_p["Accuracy"] = mapping_accuracy_paste(
+                        s1.obs[label_key], s2.obs[label_key], pi_paste, label_map
+                    )
                     rows.append(row_p)
                 except Exception as e:
                     print(f"  PASTE failed: {e}")
@@ -614,63 +509,46 @@ def benchmark_all(
             # --- SPACEL ---
             if run_spacel:
                 try:
-                    acc_ot_sc, acc_nn_sc, ratio_sc, clc_sc, t_sc = run_spacel_baseline(s1.copy(), s2.copy(), label_key, label_map)
-                    rows.append({"Sample": j, "Pair": i, "Method": "SPACEL", "Time": t_sc,
-                                 "Accuracy": acc_ot_sc, "Accuracy_NN": acc_nn_sc, "Ratio": ratio_sc,
-                                 "CLC": clc_sc})
-                    print(f"  {'SPACEL':16s} OT={acc_ot_sc:.4f}  NN={acc_nn_sc:.4f}  Ratio={ratio_sc:.4f}  CLC={clc_sc:.4f}")
+                    c1_sc, c2_sc, t_sc = run_spacel_baseline(s1.copy(), s2.copy(), label_key)
+                    rows.append(_make_row("SPACEL", t_sc, c2_sc, c1_ref=c1_sc))
                 except Exception as e:
                     print(f"  SPACEL failed: {e}")
 
             # --- STalign ---
             if run_stalign:
                 try:
-                    acc_ot_st, acc_nn_st, ratio_st, clc_st, t_st = run_stalign_baseline(s1.copy(), s2.copy(), device, label_key=label_key, label_map=label_map)
-                    rows.append({"Sample": j, "Pair": i, "Method": "STalign", "Time": t_st,
-                                 "Accuracy": acc_ot_st, "Accuracy_NN": acc_nn_st, "Ratio": ratio_st,
-                                 "CLC": clc_st})
-                    print(f"  {'STalign':16s} OT={acc_ot_st:.4f}  NN={acc_nn_st:.4f}  Ratio={ratio_st:.4f}  CLC={clc_st:.4f}")
+                    c2_st, t_st = run_stalign_baseline(s1.copy(), s2.copy(), device)
+                    rows.append(_make_row("STalign", t_st, c2_st))
                 except Exception as e:
                     print(f"  STalign failed: {e}")
 
             # --- Spateo ---
             if run_spateo:
                 try:
-                    (acc_sr_ot, acc_sr_nn, ratio_sr, clc_sr), (acc_snr_ot, acc_snr_nn, ratio_snr, clc_snr), t_s = run_spateo_baseline(s1.copy(), s2.copy(), device, label_key, label_map)
-                    rows.append({"Sample": j, "Pair": i, "Method": "Spateo_Rigid", "Time": t_s,
-                                 "Accuracy": acc_sr_ot, "Accuracy_NN": acc_sr_nn, "Ratio": ratio_sr,
-                                 "CLC": clc_sr})
-                    rows.append({"Sample": j, "Pair": i, "Method": "Spateo_Nonrigid", "Time": t_s,
-                                 "Accuracy": acc_snr_ot, "Accuracy_NN": acc_snr_nn, "Ratio": ratio_snr,
-                                 "CLC": clc_snr})
-                    print(f"  {'Spateo_Rigid':16s} OT={acc_sr_ot:.4f}  NN={acc_sr_nn:.4f}  Ratio={ratio_sr:.4f}  CLC={clc_sr:.4f}")
-                    print(f"  {'Spateo_Nonrigid':16s} OT={acc_snr_ot:.4f}  NN={acc_snr_nn:.4f}  Ratio={ratio_snr:.4f}  CLC={clc_snr:.4f}")
+                    target_sp, c_rigid_sp, c_nonrigid_sp, t_sp = run_spateo_baseline(
+                        s1.copy(), s2.copy(), device
+                    )
+                    rows.append(_make_row("Spateo_Rigid", t_sp, c_rigid_sp, c1_ref=target_sp))
+                    rows.append(_make_row("Spateo_Nonrigid", t_sp, c_nonrigid_sp, c1_ref=target_sp))
                 except Exception as e:
                     print(f"  Spateo failed: {e}")
 
             # --- Ours ---
             try:
-                # Resolve Splane info for this pair
                 _sid2 = None
                 _dfolder = None
                 if sample_id_groups is not None and j < len(sample_id_groups):
-                    _sid2 = sample_id_groups[j][i + 1]  # source slice sample_id
+                    _sid2 = sample_id_groups[j][i + 1]
                 if dataset_folders is not None and j < len(dataset_folders):
                     _dfolder = dataset_folders[j]
 
-                (acc_r_ot, acc_r_nn, ratio_r, clc_r), (acc_sp_ot, acc_sp_nn, ratio_sp, clc_sp), t_o = run_ours(
-                    s1.copy(), s2.copy(), config, device, label_key, label_map,
+                c2_rigid_o, c2_final_o, t_o = run_ours(
+                    s1.copy(), s2.copy(), config, device, label_key,
                     dataset_folder=_dfolder or "DLPFC_sample1",
                     sample_id2=_sid2,
                 )
-                rows.append({"Sample": j, "Pair": i, "Method": "INSTA-Rigid", "Time": t_o,
-                             "Accuracy": acc_r_ot, "Accuracy_NN": acc_r_nn, "Ratio": ratio_r,
-                             "CLC": clc_r})
-                rows.append({"Sample": j, "Pair": i, "Method": "INSTA-Nonrigid", "Time": t_o,
-                             "Accuracy": acc_sp_ot, "Accuracy_NN": acc_sp_nn, "Ratio": ratio_sp,
-                             "CLC": clc_sp})
-                print(f"  {'INSTA-Rigid':16s} OT={acc_r_ot:.4f}  NN={acc_r_nn:.4f}  Ratio={ratio_r:.4f}  CLC={clc_r:.4f}")
-                print(f"  {'INSTA-Nonrigid':16s} OT={acc_sp_ot:.4f}  NN={acc_sp_nn:.4f}  Ratio={ratio_sp:.4f}  CLC={clc_sp:.4f}")
+                rows.append(_make_row("INSTA-Rigid", t_o, c2_rigid_o))
+                rows.append(_make_row("INSTA-Nonrigid", t_o, c2_final_o))
             except Exception as e:
                 print(f"  Ours failed: {e}")
                 import traceback
@@ -717,41 +595,30 @@ def print_summary(df: pd.DataFrame) -> None:
         print("=" * 80)
         print(sample_mean_nn.to_string(float_format="{:.4f}".format))
 
-    # ------ Overall Mean ± Std ------
-    overall = df.groupby("Method")["Accuracy"].agg(["mean", "std"])
-    print("\n" + "=" * 80)
-    print("=== Overall Mean ± Std (OT) ===")
-    print("=" * 80)
-    for method, row in overall.iterrows():
-        print(f"  {method:20s}: {row['mean']:.4f} ± {row['std']:.4f}")
+    # ------ Overall Mean +/- Std for all metrics ------
+    metric_defs = [
+        ("Accuracy", "OT Accuracy", "higher=better"),
+        ("Accuracy_NN", "NN Accuracy", "higher=better"),
+        ("Ratio", "Ratio", "lower=better"),
+        ("CLC", "CLC", "higher=better"),
+        ("LISI", "LISI", "lower=better"),
+        ("Silhouette", "Silhouette", "higher=better"),
+        ("Chamfer", "Chamfer", "lower=better"),
+    ]
 
-    if has_nn:
-        overall_nn = df.groupby("Method")["Accuracy_NN"].agg(["mean", "std"])
+    for col, name, direction in metric_defs:
+        if col not in df.columns:
+            continue
+        overall = df.groupby("Method")[col].agg(["mean", "std"])
         print("\n" + "=" * 80)
-        print("=== Overall Mean ± Std (NN) ===")
+        print(f"=== Overall Mean +/- Std ({name}, {direction}) ===")
         print("=" * 80)
-        for method, row in overall_nn.iterrows():
-            print(f"  {method:20s}: {row['mean']:.4f} ± {row['std']:.4f}")
-
-    if "Ratio" in df.columns:
-        overall_ratio = df.groupby("Method")["Ratio"].agg(["mean", "std"])
-        print("\n" + "=" * 80)
-        print("=== Overall Mean ± Std (Ratio, lower=better) ===")
-        print("=" * 80)
-        for method, row in overall_ratio.iterrows():
-            print(f"  {method:20s}: {row['mean']:.4f} ± {row['std']:.4f}")
-
-    if "CLC" in df.columns:
-        overall_clc = df.groupby("Method")["CLC"].agg(["mean", "std"])
-        print("\n" + "=" * 80)
-        print("=== Overall Mean ± Std (CLC, higher=better) ===")
-        print("=" * 80)
-        for method, row in overall_clc.iterrows():
-            print(f"  {method:20s}: {row['mean']:.4f} ± {row['std']:.4f}")
+        for method, row in overall.iterrows():
+            print(f"  {method:20s}: {row['mean']:.4f} +/- {row['std']:.4f}")
 
 
 def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
-    """Grouped bar chart comparing all methods across 4 metrics."""
+    """Grouped bar chart comparing all methods across metrics."""
 
     method_order = [
         "No-align", "PASTE", "SPACEL", "STalign",
@@ -771,13 +638,19 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
     metrics = []
     titles = []
     if "Accuracy" in df.columns:
-        metrics.append("Accuracy"); titles.append("OT Accuracy ↑")
+        metrics.append("Accuracy"); titles.append("OT Acc \u2191")
     if "Accuracy_NN" in df.columns:
-        metrics.append("Accuracy_NN"); titles.append("NN Accuracy ↑")
+        metrics.append("Accuracy_NN"); titles.append("NN Acc \u2191")
     if "CLC" in df.columns:
-        metrics.append("CLC"); titles.append("CLC ↑")
+        metrics.append("CLC"); titles.append("CLC \u2191")
+    if "Silhouette" in df.columns:
+        metrics.append("Silhouette"); titles.append("Silhouette \u2191")
     if "Ratio" in df.columns:
-        metrics.append("Ratio"); titles.append("Ratio ↓")
+        metrics.append("Ratio"); titles.append("Ratio \u2193")
+    if "LISI" in df.columns:
+        metrics.append("LISI"); titles.append("LISI \u2193")
+    if "Chamfer" in df.columns:
+        metrics.append("Chamfer"); titles.append("Chamfer \u2193")
 
     n_metrics = len(metrics)
     n_methods = len(present)
@@ -805,7 +678,7 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
                     f"{v:.3f}", ha="center", va="bottom", fontsize=6, rotation=90)
 
     ax.set_xticks(x_base)
-    ax.set_xticklabels(titles, fontsize=11)
+    ax.set_xticklabels(titles, fontsize=10)
     ax.set_ylabel("Score")
     ax.set_title("Benchmark Comparison", fontsize=14, fontweight="bold")
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8, frameon=False)
@@ -841,7 +714,7 @@ def benchmark_dataset(
     and runs all methods on each consecutive pair.
 
     Returns:
-        DataFrame with columns ``[Dataset, Pair, Method, Time, Accuracy, Accuracy_NN, Ratio]``.
+        DataFrame with all metric columns.
     """
     from inr_align.config import SLICE_ORDER
     from inr_align.run import load_slices, preprocess_slices
@@ -878,7 +751,7 @@ def benchmark_dataset(
         run_paste=run_paste, run_spateo=run_spateo,
         run_spacel=run_spacel, run_stalign=run_stalign,
     )
-    # Rename Sample column → Dataset
+    # Rename Sample column -> Dataset
     df["Dataset"] = dataset
     df = df.drop(columns=["Sample"])
     return df

@@ -27,7 +27,6 @@ from inr_align.config import (
 from inr_align.model import (
     DeformationNet,
     ExprField,
-    ExpressionINR,
     GeneDecoder,
     WindowedPositionalEncoding,
     UnifiedCostMatcher,
@@ -38,12 +37,14 @@ from inr_align.loss import (
     compute_P_matrix,
     embedding_kl_loss,
     jacobian_reg,
-    jacobian_reg_with_div,
 )
 from inr_align.train import TrainResult, apply_model, train
 from inr_align.metrics import (
     calculate_clc,
+    chamfer_distance,
     compute_istbench_metrics,
+    compute_lisi,
+    compute_silhouette,
     coords_to_pi,
     evaluate_alignment,
     mapping_accuracy_nn,
@@ -54,7 +55,6 @@ from inr_align.metrics import (
 from inr_align.utils import (
     denormalize_coordinates,
     detect_grid_spacing,
-    griddata_resample,
     normalize_coordinates,
 )
 from inr_align.run import (
@@ -81,7 +81,6 @@ __all__ = [
     # Model
     "DeformationNet",
     "ExprField",
-    "ExpressionINR",
     "GeneDecoder",
     "WindowedPositionalEncoding",
     "UnifiedCostMatcher",
@@ -91,7 +90,6 @@ __all__ = [
     "compute_P_matrix",
     "embedding_kl_loss",
     "jacobian_reg",
-    "jacobian_reg_with_div",
     # Train
     "train",
     "apply_model",
@@ -105,11 +103,13 @@ __all__ = [
     "coords_to_pi",
     "sparse_P_to_dense_pi",
     "compute_istbench_metrics",
+    "compute_lisi",
+    "compute_silhouette",
+    "chamfer_distance",
     # Utils
     "normalize_coordinates",
     "denormalize_coordinates",
     "detect_grid_spacing",
-    "griddata_resample",
     # Pipeline
     "run",
     "align_pair",

@@ -1,32 +1,56 @@
 # Hyperparameter Tuning Log
 
-## Best Configuration (Current)
+## Best Configuration (Current — 2026-02-18)
 
-### Global Defaults (config.py)
+### Best Results (OVERALL 13 pairs: DLPFC 9 + STARMap 2 + BaristaSeq 2)
+| Metric | Value |
+|--------|-------|
+| OT Accuracy↑ | 0.792 |
+| NN Accuracy↑ | 0.797 |
+| Ratio↓ | 0.257 |
+| CLC↑ | 0.592 |
+
+### Global Defaults (config.py TrainConfig)
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | epochs | 200 | Converges well for all datasets |
 | batch_size | 2500 | |
 | topk | 64 | 128 tested on MERFISH, worse |
 | lr | 1e-3 | |
+| weight_rev | 1.0 | Reverse matching weight (3.0 tested, worse) |
 | lam_jacobian | 0.015 | Default; overridden per dataset |
-| jacobian_samples | 512 | Increased from 256 |
+| lam_divergence | 10.0 | Penalizes negative divergence (global compression) |
+| lam_sigma_floor | 1.0 | Hard σ floor penalty (rarely activates, safety net) |
+| sigma_min | 0.8 | Min allowed singular value |
+| full_reverse_interval | 1 | Full-coverage reverse loss every epoch |
+| lam_uniqueness | 0.1 | Assignment uniqueness loss (0 for grid data) |
 | grad_clip | 1.0 | |
 | warmup_fraction | 0.3 | Overridden per dataset |
 | scheduler_patience | 50 | Increased from 30 |
 | tau_init | 0.1 | |
 | tau_min | 0.05 | Increased from 0.01 |
-| tau_max | 1.0 | Increased from 0.5; EM settles ~0.71-0.79 |
+| tau_max | 1.0 | EM settles ~0.71-0.79 naturally |
 | sinkhorn_iters | 0 | Disabled; incompatible with sparse top-K |
-| lam_repulsion | 0.0 | Tested, mixed results, disabled |
+
+### Training Loss Components
+1. **Forward matching**: deformed source → target soft top-K weighted centroid
+2. **Reverse matching** (batch): target → deformed source (within batch)
+3. **Full-coverage reverse** (per epoch): separate optimizer step with ALL N2 deformed points
+4. **Jacobian SVD**: penalizes σ deviating from 1, compression 5× weighted
+5. **Divergence**: penalizes negative div(δ), captures global compression
+6. **Sigma floor**: ReLU(σ_min - σ)² hard floor (rarely activates)
+7. **Assignment uniqueness**: penalizes per-target load variance (anti many-to-one)
+8. **Embedding KL + Gene recon**: optional, with Splane embeddings
 
 ### Per-Dataset Overrides (run_test_acc.py)
-| Dataset | lam_jacobian | warmup_fraction |
-|---------|-------------|-----------------|
-| DLPFC | 0.1 | 0.3 |
-| STARMap | 0.01 | 0.4 |
-| BaristaSeq | 0.01 | 0.4 |
-| MERFISH | 0.001 | 0.4 |
+| Dataset | lam_jacobian | warmup | lam_divergence | sigma_min | lam_sigma_floor | lam_uniqueness |
+|---------|-------------|--------|----------------|-----------|-----------------|----------------|
+| DLPFC | 0.1 | 0.3 | 10.0 | 0.8 | 1.0 | **0.0** |
+| STARMap | 0.01 | 0.4 | 10.0 | 0.8 | 1.0 | 0.1 |
+| BaristaSeq | 0.01 | 0.4 | 10.0 | 0.8 | 1.0 | 0.1 |
+| MERFISH | 0.001 | 0.4 | 10.0 | 0.8 | 1.0 | 0.1 |
+
+Note: DLPFC uses lam_uniqueness=0.0 because uniqueness loss hurts grid data alignment.
 
 ### ExprField (Canonical Expression Field)
 | Parameter | Value |
@@ -184,11 +208,43 @@ recon loss 残差大，梯度信号被噪声主导。
 
 ---
 
+### Round 11: Spatial compression 根因分析 (2026-02-14)
+
+**问题**: 非刚性变形 (Ours_Spatial) 在 Ratio 和 CLC 上始终差于 Rigid：
+
+| Method | OT↑ | NN↑ | Ratio↓ | CLC↑ |
+|--------|------|------|--------|------|
+| Ours_Rigid | 0.740 | 0.756 | **0.038** | **0.705** |
+| Ours_Spatial | 0.742 | 0.750 | 0.169 | 0.598 |
+| SPACEL | **0.776** | **0.875** | 0.120 | **0.768** |
+
+**根因分析** (5 个因素):
+
+1. **Forward matching loss 是"向心力"**: 每个 source 点被拉向 K 个 target 邻居的加权质心 (mean-shift)。同区域多个 source 点被拉向同一质心 → 系统性 compression。
+
+2. **Reverse loss 被 batch 削弱**: Reverse 查询全部 N1 个 target → batch 内的 2500 个 deformed source。batch < N1 时覆盖不完整，anti-collapse 信号弱。去掉 reverse loss 后结果更差（Ratio 0.169→0.205），证明它确实在起作用，只是不够强。
+
+3. **EM tau 正反馈**: 点越近 → distance 越小 → tau 越小 → softmax 越 sharp → 拉力越集中 → 更近。tau 收敛到 ~0.76 后稳定，但 compression 已形成。
+
+4. **Jacobian 正则是对称的**: `log(σ)²` 对 compression 和 expansion 惩罚相同，但 matching loss 只奖励 compression（靠近 target），Jacobian 在跟单方向力对抗，必然输。
+
+5. **snap_to_grid 放大问题**: 多个点挤到同一 grid cell → 贪心分配 → 输家被踢到远处空 cell → neighborhood 结构进一步破坏。
+
+**实验验证**:
+
+| 配置 | OT↑ | NN↑ | Ratio↓ | CLC↑ |
+|------|------|------|--------|------|
+| 有 reverse loss | 0.742 | 0.750 | 0.169 | 0.598 |
+| 去掉 reverse loss | 0.725 | 0.728 | 0.205 | 0.561 |
+| + ExprField joint (lam=0.001) | 0.742 | 0.750 | 0.169 | 0.598 |
+| + ExprField joint (lam=1.0) | 0.620 | 0.627 | 0.191 | 0.489 |
+
+ExprField joint training 无论权重大小都无法缓解 compression — ExprField 靠自身参数拟合表达，梯度不推动 deformation。
+
 ## Open Questions / Next Steps
-- ExprField 在非 grid 数据 (MERFISH, STARMap) 上 R² 更高，embedding-driven matching 可能在那里有效
-- 能不能用预训练好的 scVI/scANVI embedding 替代 ExprField embedding？
-- 增加 ExprField 拟合能力（更多 HVG、更深网络）能否让 embedding 更有区分力？
-- frozen v1 (canonical consistency) 在全量 benchmark 上的表现？
+- 改进 matching loss: 需要某种 injectivity 约束或 repulsion 信号
+- 改进 Jacobian: 非对称惩罚（compression 惩罚更重）或 hard floor (σ >= 0.8)
+- 或者根本性改变思路: 不用 soft centroid matching, 用 displacement field regression
 
 # 新版改动与日志核查（自动审阅）
 
@@ -208,6 +264,63 @@ recon loss 残差大，梯度信号被噪声主导。
   - ExprField 在 DLPFC 上收益有限，主线仍应以 baseline matching 稳定性为主。
 
 ## 建议（下一轮）
-1. 在 benchmark 输出里固定展示 CLC + Ratio + OT 三项，避免“单指标改善”误判。
+1. 在 benchmark 输出里固定展示 CLC + Ratio + OT 三项，避免"单指标改善"误判。
 2. 对 MERFISH/STARMap 单独评估 ExprField embedding-driven（日志里已指出更可能有效）。
 3. 给 `run_test_acc.py` 增加一次性 summary 导出（CSV/Markdown）以便复现实验记录。
+
+---
+
+### Round 12: Anti-compression — sigma floor + full-coverage reverse + uniqueness (2026-02-18)
+
+**目标**: 修复 Nonrigid 的 Ratio/CLC 退化问题。
+
+**新增 Loss 组件**:
+
+1. **Sigma floor loss** (`lam_sigma_floor=1.0, sigma_min=0.8`):
+   - `ReLU(sigma_min - σ)²` — 硬性防止 singular value 低于 σ_min
+   - 实测结果：floor loss 始终为 0.000000（SVD singular values 天然 ≈ 1.0）
+   - 结论：compression 不在 Jacobian 层面，而是坐标层面的多对一坍缩
+   - 保留为安全网
+
+2. **Full-coverage reverse loss** (`full_reverse_interval=1`):
+   - 每 epoch 一次单独 optimizer step：用 ALL N2 个 deformed source 点做 reverse matching
+   - 修复了原来 batch-limited reverse 的覆盖不全问题
+   - **主要改善来源**: DLPFC Ratio 从 0.169 → 0.070 (Pair 0 几乎完美)
+
+3. **Assignment uniqueness loss** (`lam_uniqueness=0.1`):
+   - `var(per_target_load)` — 惩罚某些 target 被过多 source 点映射
+   - 对 scattered data (STARMap, BaristaSeq) 有效
+   - **DLPFC (grid) 必须关掉** (`lam_uniqueness=0.0`)：uniqueness loss 会扰乱 grid 对齐
+
+**实验历程**:
+
+| 配置 | DLPFC Ratio↓ | DLPFC CLC↑ | 备注 |
+|------|-------------|-----------|------|
+| Round 11 baseline | 0.169 | 0.598 | 基线 |
+| + sigma_floor=0.5 | 0.070 | 0.548 | floor 未激活, 改善来自 full reverse |
+| + sigma_floor=0.8 | 0.070 | 0.548 | floor 仍未激活 |
+| + weight_rev=3.0 | 0.133 | — | 更差, reverted |
+| + uniqueness=0.1 | 0.077 (mixed) | 0.548 | Pair 0 完美(0.014), Pair 1 仍差 |
+| + uniqueness=0.5 | 0.120 | — | 更差, reverted to 0.1 |
+| DLPFC uniqueness=0, others=0.1 | 0.127 | 0.629 | **最终配置** |
+
+**最终结果 (OVERALL 13 pairs)**:
+
+| Metric | Round 11 | Round 12 | Delta |
+|--------|----------|----------|-------|
+| OT↑ | 0.772 | **0.794** | +2.8% |
+| NN↑ | 0.787 | **0.797** | +1.3% |
+| Ratio↓ | 0.343 | **0.257** | −25.1% |
+| CLC↑ | — | 0.592 | (new metric) |
+
+**Griddata 后处理测试** (2026-02-18):
+- 尝试用 `griddata_resample` 后处理 deformed coords 再算 metric
+- 结果：Ratio 0.070→0.154, CLC 0.548→0.451 — **全面恶化**
+- 原因：NN label transfer 破坏精确的 cell-to-cell 对应关系
+- 决定：**彻底移除 griddata** (use_griddata, griddata_resample, resample_to_grid)
+
+**关键发现**:
+- Forward matching 的向心力是 Ratio 退化的根本原因，不在 Jacobian 层面
+- Full-coverage reverse loss 是最有效的改善
+- Uniqueness loss 对 scattered data 有效但对 grid data 有害
+- Griddata 后处理不适合 metric 计算

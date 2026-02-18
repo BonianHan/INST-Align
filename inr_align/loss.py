@@ -1,13 +1,10 @@
-"""Loss functions: soft matching, Jacobian regularization, expression reconstruction.
+"""Loss functions: soft matching, Jacobian regularization, reconstruction.
 
 Key functions:
 
-- ``compute_P_matrix`` — builds a sparse soft-assignment (transport) plan
-  between deformed source and target, using both spatial distance and
-  gene-expression cosine similarity.
-- ``expression_reconstruction_loss`` — MSE between ExpressionINR predictions
-  at deformed coordinates and ground-truth HVG expression. Gradients flow
-  back through the deformation network.
+- ``compute_P_matrix`` — sparse soft-assignment between deformed source and target.
+- ``jacobian_reg`` — SVD-based Jacobian regularization.
+- ``sparse_recon_loss`` — sparse-aware reconstruction loss (MSE_nz + L1 + Dice).
 """
 
 from __future__ import annotations
@@ -20,58 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from inr_align.model import UnifiedCostMatcher
-
-
-# ============================================================================
-# Sinkhorn normalization (doubly-stochastic transport plan)
-# ============================================================================
-
-
-def _sinkhorn_weights(
-    cost: torch.Tensor,
-    tau: float,
-    n_iters: int,
-) -> torch.Tensor:
-    """Sinkhorn normalization on a top-k cost matrix.
-
-    Given a cost matrix ``(N, K)`` where K is the top-k neighbourhood size,
-    this computes an approximate doubly-stochastic transport plan via
-    alternating row/column normalization on the Gibbs kernel.
-
-    Unlike plain softmax which only normalizes rows, Sinkhorn enforces
-    that columns (target points) receive roughly equal total mass,
-    preventing popular target points from dominating the assignment.
-
-    Note: Because the cost matrix is sparse (N×K, not N×N), true
-    doubly-stochastic normalization is approximate.  Column normalization
-    is applied across the K-neighbourhood dimension.  This still provides
-    a useful marginal-balancing effect compared to pure row-softmax.
-
-    Args:
-        cost: ``(N, K)`` unified cost (lower = better match).
-        tau: Temperature for the Gibbs kernel.
-        n_iters: Number of Sinkhorn iterations.
-
-    Returns:
-        ``(N, K)`` normalized weights that sum to 1 per row.
-    """
-    # Gibbs kernel: K_ij = exp(-C_ij / tau)
-    log_K = -cost / tau
-    # Stabilize with log-domain Sinkhorn
-    # u, v are dual variables in log-space
-    log_u = torch.zeros(cost.shape[0], 1, device=cost.device)
-    log_v = torch.zeros(1, cost.shape[1], device=cost.device)
-
-    for _ in range(n_iters):
-        # Row normalization (so each row sums to 1)
-        log_u = -torch.logsumexp(log_K + log_v, dim=1, keepdim=True)
-        # Column normalization (so each column sums to ~1)
-        log_v = -torch.logsumexp(log_K + log_u, dim=0, keepdim=True)
-
-    # Final weights with row normalization to guarantee row-sum = 1
-    log_P = log_K + log_u + log_v
-    weights = F.softmax(log_P, dim=1)
-    return weights
 
 
 # ============================================================================
@@ -127,11 +72,7 @@ def compute_P_matrix(
 
     # Logits → softmax weights
     logits = -unified_cost / matcher.tau  # (N2, K)
-
-    if matcher.sinkhorn_iters > 0:
-        weights = _sinkhorn_weights(unified_cost, matcher.tau, matcher.sinkhorn_iters)
-    else:
-        weights = F.softmax(logits, dim=1)
+    weights = F.softmax(logits, dim=1)
 
     if update_tau:
         matcher.update_tau_em(weights, unified_cost)
@@ -144,25 +85,17 @@ def compute_P_matrix(
 # ============================================================================
 
 
-def jacobian_reg_with_div(
+def jacobian_reg(
     model: nn.Module,
     x: torch.Tensor,
     alpha: torch.Tensor,
     eps: float = 1e-6,
     compression_weight: float = 5.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Asymmetric SVD-based Jacobian regularization + divergence loss.
+) -> torch.Tensor:
+    """Asymmetric SVD-based Jacobian regularization.
 
-    Computes the full Jacobian ``J_F = dF/dx`` once and extracts two losses:
-
-    1. **SVD loss** (original): penalizes singular values deviating from 1,
-       with compression (σ < 1) penalized ``compression_weight``× more.
-    2. **Divergence loss** (new): penalizes negative divergence
-       ``div(δ) = tr(J_F) - D``, which captures global compression that
-       the SVD loss misses (e.g. uniform σ ≈ 0.995 everywhere).
-
-    The Jacobian computation (the expensive part) is shared between both
-    losses, so the divergence loss has zero additional cost.
+    Penalizes singular values of the Jacobian deviating from 1,
+    with compression (σ < 1) penalized ``compression_weight``× more.
 
     Args:
         model: Deformation network ``F(x) = x + delta(x)``.
@@ -172,7 +105,7 @@ def jacobian_reg_with_div(
         compression_weight: Extra penalty multiplier for compression (σ < 1).
 
     Returns:
-        ``(svd_loss, div_loss)`` — both scalar tensors with gradients.
+        Scalar SVD loss.
     """
     x = x.requires_grad_(True)
     y = model(x, alpha)
@@ -183,36 +116,57 @@ def jacobian_reg_with_div(
         grad_out[:, d] = 1.0
         J[:, d, :] = torch.autograd.grad(y, x, grad_out, create_graph=True, retain_graph=True)[0]
 
-    # --- SVD loss (original) ---
     svals = torch.clamp(torch.linalg.svdvals(J), min=eps)
     log_svals = torch.log(svals)
     weights = torch.where(log_svals < 0, compression_weight, 1.0)
-    svd_loss = (weights * log_svals ** 2).sum(dim=1).mean()
-
-    # --- Divergence loss (new) ---
-    # div(delta) = tr(J_F) - D; negative means compression
-    # J_F = I + J_delta, so tr(J_F) = D + tr(J_delta)
-    # We want: tr(J_F) = J[0,0] + J[1,1] for 2D
-    div_delta = J[:, 0, 0] + J[:, 1, 1] - float(D)  # (B,)
-    # Only penalize compression (div < 0), not expansion
-    div_loss = torch.relu(-div_delta).pow(2).mean()
-
-    return svd_loss, div_loss
+    return (weights * log_svals ** 2).sum(dim=1).mean()
 
 
-def jacobian_reg(
-    model: nn.Module,
-    x: torch.Tensor,
-    alpha: torch.Tensor,
-    eps: float = 1e-6,
-    compression_weight: float = 5.0,
+# ============================================================================
+# Assignment uniqueness loss — directly penalizes many-to-one mapping
+# ============================================================================
+
+
+def assignment_uniqueness_loss(
+    x2_def: torch.Tensor,
+    x1: torch.Tensor,
+    topk_idx: torch.Tensor,
+    weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Backward-compatible wrapper: returns only the SVD loss.
+    """Penalize multiple source points mapping to the same target.
 
-    See :func:`jacobian_reg_with_div` for the full version.
+    For each target point, accumulates the total soft-assignment weight it
+    receives from all source points.  Any target receiving total weight > 1
+    is "over-assigned" (many-to-one).  The loss is the variance of the
+    per-target load, encouraging a uniform 1-to-1 mapping.
+
+    This directly targets the Ratio metric degradation.
+
+    Args:
+        x2_def: ``(N2, 2)`` deformed source coordinates (unused, kept for API).
+        x1: ``(N1, 2)`` target coordinates (unused, kept for API).
+        topk_idx: ``(N2, K)`` indices into x1 for each source point.
+        weights: ``(N2, K)`` soft-assignment weights (sum to 1 per row).
+
+    Returns:
+        Scalar loss — variance of per-target load.
     """
-    svd_loss, _ = jacobian_reg_with_div(model, x, alpha, eps, compression_weight)
-    return svd_loss
+    N1 = x1.shape[0]
+    N2, K = topk_idx.shape
+
+    # Accumulate total weight each target receives
+    # load[j] = sum_i weights[i, k] where topk_idx[i, k] == j
+    load = torch.zeros(N1, device=x2_def.device)
+    flat_idx = topk_idx.reshape(-1)     # (N2*K,)
+    flat_w = weights.reshape(-1)         # (N2*K,)
+    load.scatter_add_(0, flat_idx, flat_w)
+
+    # Ideal: load[j] ≈ N2/N1 for all j (uniform distribution)
+    # Penalize variance of load — high variance = some targets get lots, others get none
+    ideal_load = float(N2) / float(N1)
+    uniqueness_loss = (load - ideal_load).pow(2).mean()
+
+    return uniqueness_loss
 
 
 # ============================================================================
@@ -307,112 +261,61 @@ def compute_bidirectional_loss(
 
 
 # ============================================================================
-# Canonical consistency loss (ExprField-based)
+# Sparse-aware reconstruction loss
 # ============================================================================
 
 
-def canonical_consistency_loss(
-    expr_field: nn.Module,
-    x2_def: torch.Tensor,
-    expr2_gt: torch.Tensor,
-) -> torch.Tensor:
-    """Canonical consistency loss: deformed coords should predict source expression.
-
-    The ExprField learns a canonical expression field from all slices jointly.
-    This loss says: if a source cell with expression ``expr2_gt`` is deformed
-    to position ``x2_def``, the canonical field at that position should match
-    the cell's actual expression.  This provides an alignment signal that is
-    independent of the soft-matching — it uses the cell's own expression as
-    ground truth.
-
-    Gradients flow through both ``x2_def`` (to the DeformationNet) and
-    through the ExprField (unfrozen backbone adapts to deformed geometry).
+def _dice_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Soft Dice loss for zero/non-zero pattern preservation.
 
     Args:
-        expr_field: ``ExprField`` (backbone trainable during deformation).
-        x2_def: ``(B, 2)`` deformed source coordinates (with grad).
-        expr2_gt: ``(B, G)`` ground-truth source HVG expression (normalized).
+        pred: ``(N, G)`` predicted expression (raw values).
+        gt: ``(N, G)`` ground-truth expression.
 
     Returns:
-        Scalar MSE loss.
+        Scalar Dice loss in ``[0, 1]``.
     """
-    expr_pred = expr_field.canonical(x2_def)
-    return F.mse_loss(expr_pred, expr2_gt.detach())
+    pred_binary = 2.0 * torch.sigmoid(pred) - 1.0
+    gt_binary = (gt > 0).float()
+    intersection = (pred_binary * gt_binary).sum()
+    union = pred_binary.sum() + gt_binary.sum()
+    dice_coeff = (2.0 * intersection + 1.0) / (union + 1.0)
+    return 1.0 - dice_coeff
 
 
-# ============================================================================
-# Embedding cosine consistency loss
-# ============================================================================
-
-
-def embedding_cosine_loss(
-    expr_field: nn.Module,
-    x2_def: torch.Tensor,
-    target_fwd: torch.Tensor,
+def sparse_recon_loss(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    nz_mask: Optional[torch.Tensor] = None,
+    dice_weight: float = 0.01,
 ) -> torch.Tensor:
-    """Embedding cosine consistency: deformed source and matched target should
-    have similar canonical embeddings.
+    """Sparse-aware reconstruction loss: MSE_nonzero + L1 + Dice.
 
-    Uses the frozen ExprField's ``get_embedding`` to extract bottleneck
-    embeddings at the deformed source positions and the matched target
-    positions, then penalizes cosine dissimilarity.
-
-    Gradients flow through ``x2_def`` to the DeformationNet.
-    The ExprField should be frozen (no grad).
+    Combines three terms:
+      1. MSE on non-zero entries (biological signal)
+      2. L1 over all entries (sparsity-encouraging, robust to outliers)
+      3. Soft Dice loss on zero/non-zero pattern (weighted by ``dice_weight``)
 
     Args:
-        expr_field: Pre-trained ``ExprField`` (frozen).
-        x2_def: ``(B, 2)`` deformed source coordinates (with grad).
-        target_fwd: ``(B, 2)`` matched target positions (detached).
+        pred: ``(N, G)`` predicted expression.
+        gt: ``(N, G)`` ground-truth expression (z-score normalized).
+        nz_mask: ``(N, G)`` boolean mask — ``True`` where the *pre-normalized*
+            expression was non-zero.  ``None`` uses ``gt != 0`` as fallback.
+        dice_weight: Weight for the Dice loss term (default 0.01).
 
     Returns:
-        Scalar loss in ``[0, 2]`` (mean of ``1 - cosine_sim``).
+        Scalar loss.
     """
-    emb_src = expr_field.get_embedding(x2_def)            # (B, latent_dim)
-    emb_tgt = expr_field.get_embedding(target_fwd.detach())  # (B, latent_dim)
-    cos_sim = F.cosine_similarity(emb_src, emb_tgt, dim=1)  # (B,)
-    return (1 - cos_sim).mean()
+    if nz_mask is None:
+        nz_mask = gt != 0
 
-
-# ============================================================================
-# Expression reconstruction loss (legacy ExpressionINR)
-# ============================================================================
-
-
-def expression_reconstruction_loss(
-    expr_inr: nn.Module,
-    x2_def: torch.Tensor,
-    expr2_hvg: torch.Tensor,
-    idx: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Expression reconstruction loss via the ExpressionINR.
-
-    The ExpressionINR learns a spatial expression field from the target
-    (reference) slice.  Given deformed source coordinates ``x2_def``,
-    this function predicts the expected HVG expression at those locations
-    and compares against the actual source expression ``expr2_hvg``.
-
-    Crucially, gradients flow through ``x2_def`` back to the
-    ``DeformationNet``, so minimizing this loss encourages the deformation
-    to move source points to locations where the predicted expression
-    matches the observed expression — i.e., biologically consistent
-    positions.
-
-    Args:
-        expr_inr: Pre-trained (optionally fine-tuned) ``ExpressionINR``
-            mapping ``(N, 2) coords → (N, n_genes)``.
-        x2_def: ``(B, 2)`` deformed source coordinates (with grad).
-        expr2_hvg: ``(N2, G)`` or ``(B, G)`` ground-truth HVG expression
-            for the source slice (normalized).
-        idx: ``(B,)`` batch indices into ``expr2_hvg``.  If ``None``,
-            assumes ``expr2_hvg`` is already sliced to batch size ``B``.
-
-    Returns:
-        Scalar MSE loss.
-    """
-    expr_pred = expr_inr(x2_def)  # (B, n_genes) — gradients flow to DeformationNet
-    if idx is not None:
-        expr_target = expr2_hvg[idx]
+    nz_count = nz_mask.sum()
+    if nz_count > 0:
+        mse_nz = (pred[nz_mask] - gt[nz_mask]).pow(2).mean()
     else:
-        expr_target = expr2_hvg
-    return F.mse_loss(expr_pred, expr_target)
+        mse_nz = F.mse_loss(pred, gt)
+
+    l1 = F.l1_loss(pred, gt)
+    dice = _dice_loss(pred, gt)
+
+    return mse_nz + l1 + dice_weight * dice

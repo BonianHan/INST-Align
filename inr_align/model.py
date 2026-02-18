@@ -4,8 +4,7 @@ This module contains:
 - ``WindowedPositionalEncoding``: windowed Fourier positional encoding.
 - ``DeformationNet``: residual MLP that predicts per-point displacements.
 - ``UnifiedCostMatcher``: adaptive-temperature soft-assignment matcher.
-- ``ExpressionINR``: implicit neural field for gene expression prediction (legacy).
-- ``ExprField``: canonical expression field with batch correction (new).
+- ``ExprField``: canonical expression field with batch correction.
 - ``adaptive_icp``: PCA-guided + full-search ICP for arbitrary rotations.
 """
 
@@ -17,11 +16,15 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
 from inr_align.config import ExprFieldConfig, ICPConfig, ModelConfig, MatcherConfig
+
+# Late import to avoid circular dependency (loss.py imports from model.py)
+def _get_sparse_recon_loss():
+    from inr_align.loss import sparse_recon_loss
+    return sparse_recon_loss
 
 # ============================================================================
 # Positional Encoding
@@ -86,9 +89,6 @@ class DeformationNet(nn.Module):
     Args:
         config: Architecture hyper-parameters.
         emb_dim: Embedding dimension (0 = no embedding head).
-        grid_mode: Whether the data lies on a regular grid.
-        grid_spacing: ``(spacing_x, spacing_y)`` for grid snapping.
-        grid_origin: ``(x0, y0)`` origin of the grid.
     """
 
     def __init__(
@@ -96,9 +96,6 @@ class DeformationNet(nn.Module):
         config: Optional[ModelConfig] = None,
         *,
         emb_dim: int = 0,
-        grid_mode: bool = False,
-        grid_spacing: Optional[list] = None,
-        grid_origin: Optional[NDArray] = None,
     ):
         super().__init__()
         if config is None:
@@ -107,17 +104,6 @@ class DeformationNet(nn.Module):
         self.encoder = WindowedPositionalEncoding(config.d, config.n_freqs, config.max_freq_log2)
         self.n_freqs = config.n_freqs
         self.emb_dim = emb_dim
-        self.grid_mode = grid_mode
-
-        if grid_spacing is not None:
-            self.register_buffer("grid_spacing", torch.tensor(grid_spacing, dtype=torch.float32))
-        else:
-            self.grid_spacing = None
-
-        if grid_origin is not None:
-            self.register_buffer("grid_origin", torch.tensor(grid_origin, dtype=torch.float32))
-        else:
-            self.grid_origin = None
 
         # Shared backbone: PE → hidden layers
         backbone = []
@@ -151,7 +137,6 @@ class DeformationNet(nn.Module):
         self,
         x: torch.Tensor,
         alpha: Optional[torch.Tensor] = None,
-        snap_to_grid: bool = False,
     ) -> torch.Tensor:
         """Return deformed coordinates ``x + delta(x)``.
 
@@ -160,10 +145,7 @@ class DeformationNet(nn.Module):
         for backward compatibility with ``jacobian_reg``.
         """
         h = self.backbone(self.encoder(x, alpha))
-        x_def = x + self.coord_head(h)
-        if snap_to_grid and self.grid_mode and self.grid_spacing is not None:
-            x_def = self._snap_to_grid(x_def)
-        return x_def
+        return x + self.coord_head(h)
 
     def forward_with_emb(
         self,
@@ -176,97 +158,6 @@ class DeformationNet(nn.Module):
         emb = self.emb_head(h) if self.emb_head is not None else None
         return x_def, emb
 
-    # --------------------------------------------------------------------- #
-
-    def _snap_to_grid(self, coords: torch.Tensor) -> torch.Tensor:
-        """Snap coordinates to grid with exclusive assignment (no overlap).
-
-        Each point is assigned to its nearest grid cell.  When multiple
-        points compete for the same cell, the closest one wins and the
-        others are reassigned to the nearest *unoccupied* cell using a
-        greedy strategy ordered by snap-distance.
-
-        This guarantees a one-to-one mapping between input points and
-        grid positions, eliminating the many-to-one collapse that plain
-        ``torch.round`` would cause.
-        """
-        device = coords.device
-        origin = self.grid_origin if self.grid_origin is not None else torch.zeros(2, device=device)
-        spacing = self.grid_spacing
-
-        # --- Naive snap (same as before) ---
-        relative = coords - origin
-        grid_idx = torch.round(relative / spacing).long()   # (N, 2) integer grid indices
-        snapped_naive = grid_idx.float() * spacing + origin  # (N, 2) snapped coords
-
-        # --- Detect collisions and resolve with exclusive assignment ---
-        N = coords.shape[0]
-
-        # Encode grid index as a single integer for collision detection
-        # Shift indices to be non-negative
-        min_idx = grid_idx.min(dim=0).values
-        shifted = grid_idx - min_idx  # (N, 2) non-negative
-        W = shifted[:, 0].max().item() + 1  # width of bounding box
-        flat_idx = shifted[:, 1] * int(W) + shifted[:, 0]  # (N,) unique per grid cell
-
-        # Check for duplicates
-        unique_flat, inverse, counts = torch.unique(flat_idx, return_inverse=True, return_counts=True)
-        if counts.max().item() <= 1:
-            # No collisions — fast path
-            return snapped_naive
-
-        # --- Greedy exclusive assignment ---
-        # Distance from each point to its naive snap target
-        snap_dist = (coords - snapped_naive).pow(2).sum(dim=1)  # (N,)
-
-        # Sort all points by snap distance (closest first = highest priority)
-        order = torch.argsort(snap_dist)
-
-        result = coords.clone()
-        occupied = set()  # set of (gx, gy) tuples already taken
-
-        # Pre-compute a search radius: check neighbors within a few grid cells
-        gx_all = grid_idx[:, 0].cpu().numpy()
-        gy_all = grid_idx[:, 1].cpu().numpy()
-
-        for rank in range(N):
-            i = order[rank].item()
-            gx, gy = int(gx_all[i]), int(gy_all[i])
-
-            if (gx, gy) not in occupied:
-                # First come, first served
-                occupied.add((gx, gy))
-                result[i] = snapped_naive[i]
-            else:
-                # Find nearest unoccupied grid cell via expanding search
-                cx, cy = relative[i, 0].item() / spacing[0].item(), relative[i, 1].item() / spacing[1].item()
-                best_pos = None
-                best_d2 = float('inf')
-                for r in range(1, 20):  # search radius up to 20 grid cells
-                    found = False
-                    for dx in range(-r, r + 1):
-                        for dy in range(-r, r + 1):
-                            if abs(dx) != r and abs(dy) != r:
-                                continue  # only check the ring at distance r
-                            nx, ny = gx + dx, gy + dy
-                            if (nx, ny) not in occupied:
-                                d2 = (nx - cx) ** 2 + (ny - cy) ** 2
-                                if d2 < best_d2:
-                                    best_d2 = d2
-                                    best_pos = (nx, ny)
-                                    found = True
-                    if found and best_d2 <= (r - 0.5) ** 2:
-                        # Can't find anything closer in outer rings
-                        break
-                if best_pos is not None:
-                    occupied.add(best_pos)
-                    result[i, 0] = best_pos[0] * spacing[0] + origin[0]
-                    result[i, 1] = best_pos[1] * spacing[1] + origin[1]
-                else:
-                    # Fallback: keep naive snap (shouldn't happen)
-                    result[i] = snapped_naive[i]
-
-        return result
 
 
 # ============================================================================
@@ -351,7 +242,6 @@ class UnifiedCostMatcher:
         self.tau_max = config.tau_max
         self.lambda_feat = config.lambda_feat
         self.ema_decay = config.ema_decay
-        self.sinkhorn_iters = config.sinkhorn_iters
         self.spatial_scale: float = 1.0
         self.feat_scale: float = 1.0
 
@@ -373,63 +263,6 @@ class UnifiedCostMatcher:
         """Reset to initial state."""
         self.spatial_scale = 1.0
         self.feat_scale = 1.0
-
-
-# ============================================================================
-# Expression INR — coordinate-conditioned gene expression prediction
-# ============================================================================
-
-
-class ExpressionINR(nn.Module):
-    """Implicit neural representation for spatial gene expression fields.
-
-    Maps 2D spatial coordinates to predicted HVG gene expression values.
-    Uses the same ``WindowedPositionalEncoding`` as ``DeformationNet``.
-
-    Architecture::
-
-        coords (N, 2)  →  PE (N, d_pe)  →  MLP  →  ReLU  →  expression (N, n_genes)
-
-    Args:
-        config: Architecture and training hyper-parameters.
-        n_genes: Number of output genes (determined at runtime).
-    """
-
-    def __init__(self, config: Optional[ExprFieldConfig] = None, n_genes: int = 200):
-        super().__init__()
-        if config is None:
-            config = ExprFieldConfig()
-
-        self.encoder = WindowedPositionalEncoding(2, config.n_freqs, config.max_freq_log2)
-        self.n_freqs = config.n_freqs
-        self.n_genes = n_genes
-
-        # Build MLP
-        net = []
-        in_dim = self.encoder.d_out
-        for i in range(config.encoder_layers):
-            net.append(nn.Linear(in_dim if i == 0 else config.hidden, config.hidden))
-            net.append(nn.ReLU())
-        net.append(nn.Linear(config.hidden, n_genes))
-        # No final activation — we use per-gene z-score normalization,
-        # so output values can be negative.
-        self.net = nn.Sequential(*net)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        alpha: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Predict gene expression at spatial coordinates *x*.
-
-        Args:
-            x: ``(N, 2)`` spatial coordinates.
-            alpha: Coarse-to-fine window scalar (optional).
-
-        Returns:
-            ``(N, n_genes)`` predicted expression values.
-        """
-        return self.net(self.encoder(x, alpha))
 
 
 # ============================================================================
@@ -590,141 +423,7 @@ def normalize_expression(
         raise ValueError(f"Unknown normalization method: {method}")
 
 
-# ---- Expression INR pre-training ---------------------------------------------
-
-
-def pretrain_expression_inr(
-    expr_inr: ExpressionINR,
-    coords: torch.Tensor,
-    expression: torch.Tensor,
-    *,
-    lr: float = 1e-3,
-    epochs: int = 300,
-    warmup_fraction: float = 0.3,
-    print_every: int = 50,
-) -> ExpressionINR:
-    """Pre-train the ExpressionINR on target-slice expression (legacy).
-
-    Learns the mapping ``coords → expression`` using MSE loss with
-    coarse-to-fine alpha scheduling.
-
-    Args:
-        expr_inr: ``ExpressionINR`` model (on device).
-        coords: ``(N, 2)`` target coordinates (normalized, on device).
-        expression: ``(N, G)`` target HVG expression (normalized, on device).
-        lr: Learning rate.
-        epochs: Number of pre-training epochs.
-        warmup_fraction: Fraction of epochs for coarse-to-fine warmup.
-        print_every: Print interval.
-
-    Returns:
-        Trained ``ExpressionINR`` with best checkpoint restored.
-    """
-    optimizer = torch.optim.Adam(expr_inr.parameters(), lr=lr)
-    n_freqs = expr_inr.n_freqs
-    best_loss = float("inf")
-    best_state = None
-    start = time.time()
-
-    for ep in range(epochs):
-        warmup = int(epochs * warmup_fraction)
-        alpha = n_freqs * (ep / warmup) if ep < warmup else float(n_freqs)
-        alpha_t = torch.tensor(alpha, device=coords.device)
-
-        optimizer.zero_grad(set_to_none=True)
-        pred = expr_inr(coords, alpha_t)
-        loss = F.mse_loss(pred, expression)
-        loss.backward()
-        optimizer.step()
-
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            best_state = {k: v.cpu().clone() for k, v in expr_inr.state_dict().items()}
-
-        if ep % print_every == 0 or ep == epochs - 1:
-            # R-squared
-            with torch.no_grad():
-                ss_res = (expression - pred).pow(2).sum()
-                ss_tot = (expression - expression.mean(dim=0)).pow(2).sum()
-                r2 = 1 - ss_res / (ss_tot + 1e-8)
-            print(
-                f"    ExprINR pretrain ep={ep:03d} | "
-                f"MSE={loss.item():.6f} | R²={r2.item():.4f}"
-            )
-
-    # Restore best
-    if best_state:
-        expr_inr.load_state_dict({k: v.to(coords.device) for k, v in best_state.items()})
-
-    elapsed = time.time() - start
-    print(f"    ExprINR pretrain done. Best MSE={best_loss:.6f} ({elapsed:.1f}s)")
-    return expr_inr
-
-
 # ---- ExprField joint pre-training --------------------------------------------
-
-
-def _dice_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    """Soft Dice loss for zero/non-zero pattern preservation.
-
-    Maps predictions to [-1, 1] via ``2*sigmoid - 1`` to give a stronger
-    gradient signal near zero than plain sigmoid (which saturates at 0/1).
-
-    Args:
-        pred: ``(N, G)`` predicted expression (raw values).
-        gt: ``(N, G)`` ground-truth expression.
-
-    Returns:
-        Scalar Dice loss in ``[0, 1]``.
-    """
-    pred_binary = 2.0 * torch.sigmoid(pred) - 1.0
-    gt_binary = (gt > 0).float()
-    intersection = (pred_binary * gt_binary).sum()
-    union = pred_binary.sum() + gt_binary.sum()
-    dice_coeff = (2.0 * intersection + 1.0) / (union + 1.0)
-    return 1.0 - dice_coeff
-
-
-def _sparse_recon_loss(
-    pred: torch.Tensor,
-    gt: torch.Tensor,
-    nz_mask: Optional[torch.Tensor] = None,
-    dice_weight: float = 0.01,
-) -> torch.Tensor:
-    """Sparse-aware reconstruction loss: MSE_nonzero + L1 + Dice.
-
-    Combines three terms:
-      1. MSE on non-zero entries (biological signal)
-      2. L1 over all entries (sparsity-encouraging, robust to outliers)
-      3. Soft Dice loss on zero/non-zero pattern (weighted by ``dice_weight``)
-
-    Args:
-        pred: ``(N, G)`` predicted expression.
-        gt: ``(N, G)`` ground-truth expression (z-score normalized).
-        nz_mask: ``(N, G)`` boolean mask — ``True`` where the *pre-normalized*
-            expression was non-zero.  ``None`` uses ``gt != 0`` as fallback.
-        dice_weight: Weight for the Dice loss term (default 0.01).
-
-    Returns:
-        Scalar loss.
-    """
-    if nz_mask is None:
-        nz_mask = gt != 0
-
-    # 1. MSE on non-zero entries (biological signal)
-    nz_count = nz_mask.sum()
-    if nz_count > 0:
-        mse_nz = (pred[nz_mask] - gt[nz_mask]).pow(2).mean()
-    else:
-        mse_nz = F.mse_loss(pred, gt)
-
-    # 2. L1 over all entries (robust to outliers, encourages sparsity)
-    l1 = F.l1_loss(pred, gt)
-
-    # 3. Soft Dice loss on the non-zero pattern
-    dice = _dice_loss(pred, gt)
-
-    return mse_nz + l1 + dice_weight * dice
 
 
 def pretrain_expr_field(
@@ -783,7 +482,7 @@ def pretrain_expr_field(
         for s in range(n_slices):
             pred = expr_field(coords_list[s], slice_ids[s], alpha_t)
             mask_s = nz_masks[s] if use_sparse else None
-            total_recon = total_recon + _sparse_recon_loss(pred, expr_list[s], mask_s)
+            total_recon = total_recon + _get_sparse_recon_loss()(pred, expr_list[s], mask_s)
 
         # L2 regularization on batch embeddings
         batch_reg = config.pretrain_batch_reg * expr_field.batch_emb.weight.pow(2).mean()
@@ -844,35 +543,6 @@ def nn_rmse(A: NDArray, B: NDArray) -> float:
 # ============================================================================
 # Rigid Alignment — ICP
 # ============================================================================
-
-
-def pca_coarse_align(A: NDArray, B: NDArray) -> Tuple[NDArray, NDArray, float]:
-    """PCA axis alignment with 4-candidate disambiguation.
-
-    Returns:
-        ``(R, t, rmse)`` of the best candidate.
-    """
-    muA, UA, _ = pca_axes(A)
-    muB, UB, _ = pca_axes(B)
-
-    Bc = B - muB
-    candidates = []
-
-    for swap in [False, True]:
-        UBs = UB[:, [1, 0]].copy() if swap else UB.copy()
-        for flip in [+1, -1]:
-            Utmp = UBs.copy()
-            Utmp[:, 1] *= flip
-            if np.linalg.det(Utmp) < 0:
-                Utmp[:, 0] *= -1
-            R = UA @ Utmp.T
-            B_try = (Bc @ R.T) + muA
-            err = nn_rmse(A, B_try)
-            candidates.append((err, R, muA - muB @ R.T))
-
-    candidates.sort(key=lambda x: x[0])
-    best_err, R_best, t_best = candidates[0]
-    return R_best, t_best, best_err
 
 
 def icp_refine(

@@ -296,7 +296,158 @@ def gene_expr_similarity(
 
 
 # ============================================================================
-# 6. Comprehensive evaluation
+# 6. LISI (Local Inverse Simpson's Index)
+# ============================================================================
+
+
+def compute_lisi(
+    coords1: NDArray,
+    coords2_aligned: NDArray,
+    labels1: NDArray,
+    labels2: NDArray,
+    k: int = 30,
+) -> float:
+    """Domain LISI on combined aligned point cloud.
+
+    Combines both slices into one point cloud and computes the Local
+    Inverse Simpson's Index for domain labels.  If alignment is good,
+    same domains from both slices overlap and local neighbourhoods are
+    dominated by a single domain (LISI close to 1).
+
+    Args:
+        coords1: ``(N1, 2)`` reference spatial coordinates.
+        coords2_aligned: ``(N2, 2)`` aligned source spatial coordinates.
+        labels1: ``(N1,)`` domain labels for slice 1.
+        labels2: ``(N2,)`` domain labels for slice 2.
+        k: Number of neighbours for LISI computation.
+
+    Returns:
+        Median LISI score (**lower is better**, minimum 1.0).
+    """
+    combined_coords = np.vstack([
+        np.asarray(coords1, dtype=np.float64),
+        np.asarray(coords2_aligned, dtype=np.float64),
+    ])
+    combined_labels = np.concatenate([np.asarray(labels1), np.asarray(labels2)])
+
+    # Filter invalid labels
+    valid = np.array([str(l).strip() not in ("", "nan") for l in combined_labels])
+    if valid.sum() < k + 1:
+        return float("nan")
+
+    coords = combined_coords[valid]
+    labels = combined_labels[valid]
+    n = len(coords)
+    k_actual = min(k, n - 1)
+
+    tree = cKDTree(coords)
+    _, indices = tree.query(coords, k=k_actual + 1)
+    indices = indices[:, 1:]  # exclude self
+
+    unique_labels, label_codes = np.unique(labels, return_inverse=True)
+    nbr_codes = label_codes[indices]  # (N, k)
+
+    # Simpson's index per cell: sum of squared label frequencies
+    simpson = np.zeros(n)
+    for c in range(len(unique_labels)):
+        freq = np.mean(nbr_codes == c, axis=1)
+        simpson += freq ** 2
+
+    lisi = 1.0 / np.maximum(simpson, 1e-12)
+    return float(np.median(lisi))
+
+
+# ============================================================================
+# 7. Silhouette Score
+# ============================================================================
+
+
+def compute_silhouette(
+    coords1: NDArray,
+    coords2_aligned: NDArray,
+    labels1: NDArray,
+    labels2: NDArray,
+    max_samples: int = 5000,
+    seed: int = 42,
+) -> float:
+    """Silhouette score on domain labels in combined aligned space.
+
+    Combines both slices and computes the silhouette score for domain
+    labels.  Higher score means better spatial separation of domains
+    after alignment.
+
+    Args:
+        coords1: ``(N1, 2)`` reference spatial coordinates.
+        coords2_aligned: ``(N2, 2)`` aligned source spatial coordinates.
+        labels1: ``(N1,)`` domain labels for slice 1.
+        labels2: ``(N2,)`` domain labels for slice 2.
+        max_samples: Subsample to this size for speed.
+        seed: Random seed for subsampling.
+
+    Returns:
+        Silhouette score in ``[-1, 1]`` (**higher is better**).
+    """
+    from sklearn.metrics import silhouette_score
+
+    combined_coords = np.vstack([
+        np.asarray(coords1, dtype=np.float64),
+        np.asarray(coords2_aligned, dtype=np.float64),
+    ])
+    combined_labels = np.concatenate([np.asarray(labels1), np.asarray(labels2)])
+
+    valid = np.array([str(l).strip() not in ("", "nan") for l in combined_labels])
+    coords = combined_coords[valid]
+    labels = combined_labels[valid]
+
+    unique_labels = np.unique(labels)
+    if len(unique_labels) < 2 or len(coords) < 10:
+        return float("nan")
+
+    # Subsample for speed
+    rng = np.random.default_rng(seed)
+    if len(coords) > max_samples:
+        idx = rng.choice(len(coords), max_samples, replace=False)
+        coords = coords[idx]
+        labels = labels[idx]
+
+    return float(silhouette_score(coords, labels))
+
+
+# ============================================================================
+# 8. Chamfer Distance
+# ============================================================================
+
+
+def chamfer_distance(
+    coords1: NDArray,
+    coords2_aligned: NDArray,
+) -> float:
+    """Symmetric Chamfer distance between two point clouds.
+
+    For each point in one cloud, finds the nearest point in the other
+    and averages.  Measures geometric alignment quality.
+
+    Args:
+        coords1: ``(N1, 2)`` reference spatial coordinates.
+        coords2_aligned: ``(N2, 2)`` aligned source spatial coordinates.
+
+    Returns:
+        Mean Chamfer distance (**lower is better**).
+    """
+    c1 = np.asarray(coords1, dtype=np.float64)
+    c2 = np.asarray(coords2_aligned, dtype=np.float64)
+
+    tree1 = cKDTree(c1)
+    tree2 = cKDTree(c2)
+
+    d12, _ = tree2.query(c1, k=1)  # c1 -> nearest in c2
+    d21, _ = tree1.query(c2, k=1)  # c2 -> nearest in c1
+
+    return float((d12.mean() + d21.mean()) / 2)
+
+
+# ============================================================================
+# 9. Comprehensive evaluation
 # ============================================================================
 
 
@@ -328,6 +479,9 @@ def evaluate_alignment(
     acc_nn = mapping_accuracy_nn(labels1, labels2, coords1, coords2)
     ot_res = mapping_accuracy_ot(labels1, labels2, coords1, coords2, max_samples=max_samples, seed=seed)
     clc = calculate_clc(labels1, labels2, coords1, coords2)
+    lisi = compute_lisi(coords1, coords2, labels1, labels2)
+    sil = compute_silhouette(coords1, coords2, labels1, labels2)
+    chamfer = chamfer_distance(coords1, coords2)
 
     return {
         "nn_accuracy": acc_nn,
@@ -335,6 +489,9 @@ def evaluate_alignment(
         "ot_upper_bound": ot_res["upper_bound"],
         "ot_normalized": ot_res["normalized"],
         "clc": clc,
+        "lisi": lisi,
+        "silhouette": sil,
+        "chamfer": chamfer,
     }
 
 

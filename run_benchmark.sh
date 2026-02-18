@@ -91,7 +91,6 @@ python -u run_test_acc.py \
     --matcher_tau_max 0.5 \
     --matcher_lambda_feat 1.0 \
     --matcher_ema_decay 0.9 \
-    --matcher_sinkhorn_iters 0 \
     \
     --train_epochs 200 \
     --train_batch_size 2500 \

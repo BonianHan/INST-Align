@@ -122,7 +122,7 @@ def main():
     # DLPFC hyperparameter overrides
     config.train.lam_jacobian = 0.1
     config.train.warmup_fraction = 0.3
-    config.icp.mode = "adaptive"  # Use full rotation search for DLPFC
+    config.icp.mode = "icp_only"
 
     # ================================================================
     # Part 1: Alignment Benchmark (4 metrics: OT, NN, Ratio, CLC)

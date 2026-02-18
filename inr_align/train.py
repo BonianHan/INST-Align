@@ -12,8 +12,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from inr_align.config import TrainConfig
-from inr_align.loss import compute_P_matrix, embedding_kl_loss, jacobian_reg, jacobian_reg_with_div
-from inr_align.model import DeformationNet, ExprField, GeneDecoder, UnifiedCostMatcher, _sparse_recon_loss
+from inr_align.loss import (
+    assignment_uniqueness_loss,
+    compute_P_matrix,
+    embedding_kl_loss,
+    jacobian_reg,
+    sparse_recon_loss,
+)
+from inr_align.model import DeformationNet, ExprField, GeneDecoder, UnifiedCostMatcher
 
 
 # ============================================================================
@@ -62,7 +68,7 @@ def train(
 
     Losses:
       1. Bidirectional soft matching (forward + reverse)
-      2. Jacobian regularization (SVD isometry + divergence anti-compression)
+      2. Jacobian regularization (SVD isometry)
       3. Splane embedding KL (DeformationNet emb_head → Splane target)
       4. Gene reconstruction (GeneDecoder: emb + batch → gene expression)
       5. Expression reconstruction (ExprField, legacy joint training)
@@ -139,7 +145,7 @@ def train(
         epoch_loss = 0.0
         epoch_match = 0.0
         epoch_expr = 0.0
-        epoch_div = 0.0
+        epoch_uniq = 0.0
         epoch_kl = 0.0
         epoch_recon = 0.0
         n_batch = 0
@@ -157,7 +163,7 @@ def train(
             if use_kl or use_recon:
                 x2_def, emb_pred = model.forward_with_emb(x2_input, alpha_t)
             else:
-                x2_def = model(x2_input, alpha_t, snap_to_grid=config.snap_to_grid_training)
+                x2_def = model(x2_input, alpha_t)
                 emb_pred = None
 
             # Forward loss: deformed source → target
@@ -179,17 +185,19 @@ def train(
 
             L_match = loss_fwd + config.weight_rev * loss_rev
 
-            # Jacobian regularization (SVD + divergence)
+            # Assignment uniqueness loss — penalizes many-to-one mapping
+            L_uniq_val = 0.0
+            if config.lam_uniqueness > 0:
+                L_uniq = assignment_uniqueness_loss(x2_def, x1, idx_fwd, w_fwd)
+                L_uniq_val = L_uniq.item()
+
+            # Jacobian regularization (SVD)
             loss = L_match
-            L_div_val = 0.0
-            use_jac = config.lam_jacobian > 0 or config.lam_divergence > 0
-            if use_jac:
-                L_svd, L_div = jacobian_reg_with_div(model, x2_input, alpha_t)
-                if config.lam_jacobian > 0:
-                    loss = loss + config.lam_jacobian * L_svd
-                if config.lam_divergence > 0:
-                    loss = loss + config.lam_divergence * L_div
-                    L_div_val = L_div.item()
+            if config.lam_uniqueness > 0:
+                loss = loss + config.lam_uniqueness * L_uniq
+            if config.lam_jacobian > 0:
+                L_svd = jacobian_reg(model, x2_input, alpha_t)
+                loss = loss + config.lam_jacobian * L_svd
 
             # Splane embedding KL loss (after warmup)
             L_kl_val = 0.0
@@ -205,7 +213,7 @@ def train(
                 sid_batch = slice_ids2[idx]
                 gene_pred = gene_decoder(emb_pred, sid_batch)
                 gene_target = gene_expr2_gt[idx]
-                L_recon = _sparse_recon_loss(gene_pred, gene_target)
+                L_recon = sparse_recon_loss(gene_pred, gene_target)
                 loss = loss + config.lam_recon * L_recon
                 L_recon_val = L_recon.item()
 
@@ -214,7 +222,7 @@ def train(
             if use_expr and ep >= warmup:
                 expr_pred = expr_field(x2_def)
                 expr_target = expr2_gt[idx]
-                L_expr = _sparse_recon_loss(expr_pred, expr_target)
+                L_expr = sparse_recon_loss(expr_pred, expr_target)
                 loss = loss + lam_expr * L_expr
                 L_expr_val = L_expr.item()
 
@@ -230,10 +238,32 @@ def train(
             epoch_loss += loss.item()
             epoch_match += L_match.item()
             epoch_expr += L_expr_val
-            epoch_div += L_div_val
+            epoch_uniq += L_uniq_val
             epoch_kl += L_kl_val
             epoch_recon += L_recon_val
             n_batch += 1
+
+        # --- Full-coverage reverse loss (separate optimizer step) ---
+        # Ensures every x1 point can find its nearest match across ALL
+        # deformed source points, not just the current batch.
+        if config.full_reverse_interval > 0 and ep % config.full_reverse_interval == 0:
+            optimizer.zero_grad(set_to_none=True)
+            x2_all_input = x2.requires_grad_(True)
+            if use_kl or use_recon:
+                x2_def_all, _ = model.forward_with_emb(x2_all_input, alpha_t)
+            else:
+                x2_def_all = model(x2_all_input, alpha_t)
+            K_rev_full = min(config.topk, N2)
+            idx_rev_full, w_rev_full = compute_P_matrix(
+                x1, x2_def_all, emb1_norm, emb2_norm, matcher, config.topk, update_tau=False
+            )
+            x2_nbrs_full = x2_def_all[idx_rev_full.reshape(-1)].reshape(N1, K_rev_full, 2)
+            target_rev_full = torch.einsum("bk,bkd->bd", w_rev_full, x2_nbrs_full)
+            loss_rev_full = config.weight_rev * (x1 - target_rev_full).pow(2).sum(dim=1).mean()
+            loss_rev_full.backward()
+            if config.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            optimizer.step()
 
         avg_match = epoch_match / n_batch
         if avg_match < best_match:
@@ -252,8 +282,8 @@ def train(
             "epoch": ep, "loss": epoch_loss / n_batch, "match": avg_match,
             "tau": matcher.tau, "lr": cur_lr,
         }
-        if config.lam_divergence > 0:
-            record["div"] = epoch_div / n_batch
+        if config.lam_uniqueness > 0:
+            record["uniq"] = epoch_uniq / n_batch
         if use_kl:
             record["kl"] = epoch_kl / n_batch
         if use_recon:
@@ -265,8 +295,8 @@ def train(
         if ep % config.print_every == 0 or ep == config.epochs - 1:
             parts = [f"ep={ep:03d} | lr={cur_lr:.1e} | \u03c4={matcher.tau:.5f}"]
             parts.append(f"loss={epoch_loss / n_batch:.5f} match={avg_match:.5f}")
-            if config.lam_divergence > 0:
-                parts.append(f"div={epoch_div / n_batch:.6f}")
+            if config.lam_uniqueness > 0:
+                parts.append(f"uniq={epoch_uniq / n_batch:.6f}")
             if use_kl:
                 parts.append(f"kl={epoch_kl / n_batch:.5f}")
             if use_recon:
@@ -309,7 +339,6 @@ def train(
 def apply_model(
     model: DeformationNet,
     x: torch.Tensor,
-    snap_to_grid: bool = False,
 ) -> torch.Tensor:
     """Apply the trained deformation network.
 
@@ -317,4 +346,4 @@ def apply_model(
     explicitly.
     """
     alpha = torch.tensor(float(model.n_freqs), device=x.device)
-    return model(x, alpha, snap_to_grid=snap_to_grid)
+    return model(x, alpha)
