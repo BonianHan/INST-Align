@@ -13,9 +13,8 @@ Benchmark::
 from inr_align.config import (
     DLPFC_SAMPLE_GROUPS,
     SLICE_ORDER,
-    ExprFieldConfig,
-    GeneDecoderConfig,
     ICPConfig,
+    JointConfig,
     MatcherConfig,
     ModelConfig,
     PipelineConfig,
@@ -26,19 +25,30 @@ from inr_align.config import (
 )
 from inr_align.model import (
     DeformationNet,
-    ExprField,
-    GeneDecoder,
+    ExprEncoder,
+    ExprINR,
+    ExprDecoder,
+    GradientReversalLayer,
+    SliceDiscriminator,
     WindowedPositionalEncoding,
     UnifiedCostMatcher,
     adaptive_icp,
-    normalize_expression,
+    build_joint_models,
+    build_knn_graph,
 )
 from inr_align.loss import (
+    adversarial_loss,
+    assignment_uniqueness_loss,
     compute_P_matrix,
-    embedding_kl_loss,
+    dice_loss,
+    grl_lambda_schedule,
     jacobian_reg,
+    matching_loss_joint,
+    recon_loss,
+    recon_loss_from_emb,
+    spatial_smooth_loss,
 )
-from inr_align.train import TrainResult, apply_model, train
+from inr_align.engine import TrainResult, apply_model, apply_model_with_inr, train
 from inr_align.metrics import (
     calculate_clc,
     chamfer_distance,
@@ -62,7 +72,7 @@ from inr_align.run import (
 )
 from inr_align.benchmark import benchmark_all, benchmark_dataset, print_summary, plot_comparison
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 
 __all__ = [
     # Config
@@ -71,8 +81,7 @@ __all__ = [
     "MatcherConfig",
     "TrainConfig",
     "ICPConfig",
-    "ExprFieldConfig",
-    "GeneDecoderConfig",
+    "JointConfig",
     "SLICE_ORDER",
     "DLPFC_SAMPLE_GROUPS",
     "add_pipeline_args",
@@ -80,19 +89,31 @@ __all__ = [
     "print_config",
     # Model
     "DeformationNet",
-    "ExprField",
-    "GeneDecoder",
+    "ExprEncoder",
+    "ExprINR",
+    "ExprDecoder",
+    "GradientReversalLayer",
+    "SliceDiscriminator",
     "WindowedPositionalEncoding",
     "UnifiedCostMatcher",
     "adaptive_icp",
-    "normalize_expression",
+    "build_joint_models",
+    "build_knn_graph",
     # Loss
+    "adversarial_loss",
+    "assignment_uniqueness_loss",
     "compute_P_matrix",
-    "embedding_kl_loss",
+    "dice_loss",
+    "grl_lambda_schedule",
     "jacobian_reg",
-    # Train
+    "matching_loss_joint",
+    "recon_loss",
+    "recon_loss_from_emb",
+    "spatial_smooth_loss",
+    # Engine
     "train",
     "apply_model",
+    "apply_model_with_inr",
     "TrainResult",
     # Metrics
     "mapping_accuracy_nn",

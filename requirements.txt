@@ -27,5 +27,4 @@ numba>=0.56
 # --- Baseline methods (for benchmark comparison) ---
 paste-bio>=1.4                # PASTE alignment
 spateo-release>=0.0.1         # Spateo alignment
-SPACEL>=1.1                   # SPACEL Scube alignment (Splane embeddings)
 # STalign: pip install git+https://github.com/JEFworks-Lab/STalign.git

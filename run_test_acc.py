@@ -30,10 +30,9 @@ Metrics:
 Methods compared:
     1. No-align   -- raw coordinates, no alignment
     2. PASTE      -- Fused Gromov-Wasserstein (alpha=0.1)
-    3. SPACEL     -- Scube.align (graph-based)
-    4. STalign    -- LDDMM diffeomorphic registration
-    5. Spateo     -- morpho_align rigid + nonrigid
-    6. Ours       -- adaptive_icp + INR deformation (rigid / spatial)
+    3. STalign    -- LDDMM diffeomorphic registration
+    4. Spateo     -- morpho_align rigid + nonrigid
+    5. Ours       -- adaptive_icp + INR deformation (rigid / spatial)
 """
 
 from __future__ import annotations
@@ -97,6 +96,8 @@ def _config_for_dataset(config: PipelineConfig, dataset: str) -> PipelineConfig:
     for field_name, value in overrides.items():
         if hasattr(cfg.train, field_name):
             setattr(cfg.train, field_name, value)
+        elif hasattr(cfg.joint, field_name):
+            setattr(cfg.joint, field_name, value)
     parts = [f"{k}={v}" for k, v in overrides.items()]
     print(f"  [dataset override] {dataset}: {', '.join(parts)}")
     return cfg
@@ -196,7 +197,6 @@ def run_dlpfc_benchmark(
     device: str,
     run_paste: bool,
     run_spateo: bool,
-    run_spacel: bool = True,
     run_stalign: bool = True,
 ) -> pd.DataFrame:
     """Run DLPFC benchmark using original_data format (3 sample groups)."""
@@ -205,11 +205,11 @@ def run_dlpfc_benchmark(
     print("#" * 60)
 
     layer_groups = _load_dlpfc_layer_groups(config.data_dir)
-    df = benchmark_all(
+    df, *_ = benchmark_all(
         layer_groups, config, device=device,
         label_key="original_domain", label_map=DLPFC_LABEL_MAP,
         run_paste=run_paste, run_spateo=run_spateo,
-        run_spacel=run_spacel, run_stalign=run_stalign,
+        run_stalign=run_stalign,
     )
 
     # Map Sample index → DLPFC_sampleN, keep Pair
@@ -223,7 +223,6 @@ def main(
     datasets: Optional[List[str]] = None,
     run_paste: bool = True,
     run_spateo: bool = True,
-    run_spacel: bool = True,
     run_stalign: bool = True,
 ) -> None:
     """Run benchmark on all (or specified) datasets.
@@ -234,7 +233,6 @@ def main(
             Use "DLPFC" shorthand to include all 3 DLPFC samples.
         run_paste: Include PASTE baseline.
         run_spateo: Include Spateo baseline.
-        run_spacel: Include SPACEL baseline.
         run_stalign: Include STalign baseline.
     """
     if config is None:
@@ -293,11 +291,11 @@ def main(
                 dataset_folders.append(folder)
 
             dlpfc_config = _config_for_dataset(config, "DLPFC")
-            df_dlpfc = benchmark_all(
+            df_dlpfc, *_ = benchmark_all(
                 layer_groups, dlpfc_config, device=device,
                 label_key="original_domain", label_map=DLPFC_LABEL_MAP,
                 run_paste=run_paste, run_spateo=run_spateo,
-                run_spacel=run_spacel, run_stalign=run_stalign,
+                run_stalign=run_stalign,
                 sample_id_groups=sample_id_groups,
                 dataset_folders=dataset_folders,
             )
@@ -318,7 +316,7 @@ def main(
             dataset, ds_config, device=device,
             label_key="original_domain",
             run_paste=run_paste, run_spateo=run_spateo,
-            run_spacel=run_spacel, run_stalign=run_stalign,
+            run_stalign=run_stalign,
         )
         if len(df) > 0:
             all_dfs.append(df)
@@ -346,7 +344,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--no_paste", action="store_true", help="Skip PASTE baseline")
     parser.add_argument("--no_spateo", action="store_true", help="Skip Spateo baseline")
-    parser.add_argument("--no_spacel", action="store_true", help="Skip SPACEL baseline")
     parser.add_argument("--no_stalign", action="store_true", help="Skip STalign baseline")
     # All pipeline config args
     add_pipeline_args(parser)
@@ -360,6 +357,5 @@ if __name__ == "__main__":
         datasets=args.datasets,
         run_paste=not args.no_paste,
         run_spateo=not args.no_spateo,
-        run_spacel=not args.no_spacel,
         run_stalign=not args.no_stalign,
     )

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Extract Splane embeddings for DLPFC sample1.
 
-Run in spacel conda env:
-    conda activate spacel
+Requires SPACEL package (Splane module).
+
+Usage:
     python extract_splane_emb.py
 """
 

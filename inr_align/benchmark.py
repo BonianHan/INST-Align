@@ -1,4 +1,4 @@
-"""Multi-method benchmark: PASTE / Spateo / SPACEL / STalign / Ours / No-align.
+"""Multi-method benchmark: PASTE / Spateo / STalign / Ours / No-align.
 
 Compares all methods on the same dataset using seven metrics:
 
@@ -33,10 +33,7 @@ import seaborn as sns
 import spateo as st
 import torch
 
-import scipy.sparse
-
-from inr_align.config import DLPFC_SAMPLE_GROUPS, PipelineConfig
-from inr_align.loss import compute_P_matrix
+from inr_align.config import DLPFC_SAMPLE_GROUPS, JointConfig, PipelineConfig
 from inr_align.metrics import (
     calculate_clc,
     chamfer_distance,
@@ -48,13 +45,11 @@ from inr_align.metrics import (
     sparse_P_to_dense_pi,
 )
 from inr_align.model import (
-    DeformationNet, GeneDecoder, UnifiedCostMatcher, adaptive_icp,
-    normalize_expression, ExprField,
+    DeformationNet, UnifiedCostMatcher, adaptive_icp,
+    build_joint_models, build_knn_graph, ExprINR,
 )
-from inr_align.train import apply_model, train
+from inr_align.engine import apply_model, train
 from inr_align.utils import detect_grid_spacing, normalize_coordinates
-from inr_align.loss1 import align_pair_joint
-from inr_align.model1 import JointConfig
 
 
 # ============================================================================
@@ -126,57 +121,6 @@ def run_spateo_baseline(
     return target_coords, coords_rigid, coords_nonrigid, elapsed
 
 
-def run_spacel_baseline(
-    slice1,
-    slice2,
-    label_key: str = "original_domain",
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """SPACEL Scube.align (graph-based alignment).
-
-    Runs in a separate ``spacel`` conda environment via subprocess,
-    because SPACEL requires ``torch<=1.13`` which is incompatible with
-    the main environment.
-
-    Returns:
-        ``(coords1_aligned, coords2_aligned, elapsed_time)``.
-    """
-    import os
-    import subprocess
-    import tempfile
-
-    # Save slices to temp files
-    with tempfile.TemporaryDirectory() as tmpdir:
-        s1_path = os.path.join(tmpdir, "s1.h5ad")
-        s2_path = os.path.join(tmpdir, "s2.h5ad")
-        out_path = os.path.join(tmpdir, "result.npz")
-
-        slice1.write_h5ad(s1_path)
-        slice2.write_h5ad(s2_path)
-
-        # Find spacel_runner.py relative to this file
-        runner = os.path.join(os.path.dirname(os.path.dirname(__file__)), "spacel_runner.py")
-
-        cmd = [
-            "conda", "run", "-n", "spacel", "--no-capture-output",
-            "python", runner,
-            "--slice1", s1_path,
-            "--slice2", s2_path,
-            "--label_key", label_key,
-            "--output", out_path,
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"SPACEL subprocess failed:\n{result.stderr}")
-
-        data = np.load(out_path)
-        coords1 = data["coords1"]
-        coords2 = data["coords2"]
-        elapsed = float(data["elapsed"])
-
-    return coords1, coords2, elapsed
-
-
 def run_stalign_baseline(
     slice1,
     slice2,
@@ -219,83 +163,17 @@ def run_stalign_baseline(
     return coords2_aligned, elapsed
 
 
-def _load_splane_embeddings(
-    slice_obj,
-    sample_id: str,
-    data_dir: str = "./Data",
-    dataset_folder: str = "DLPFC_sample1",
-) -> Optional[np.ndarray]:
-    """Try to load pre-computed Splane embeddings for a slice.
-
-    Looks for ``{data_dir}/{dataset_folder}/splane_embeddings.npz``
-    with key ``emb_{sample_id}``.
-
-    Returns:
-        ``(N, D)`` embedding array or ``None`` if not found.
-    """
-    import os
-    splane_path = os.path.join(data_dir, dataset_folder, "splane_embeddings.npz")
-    if not os.path.exists(splane_path):
-        return None
-    data = np.load(splane_path)
-    key = f"emb_{sample_id}"
-    if key in data:
-        return data[key].astype(np.float32)
-    return None
-
-
-def _prepare_gene_expr(
-    slice_obj,
-    n_hvg: int = 2000,
-    device: str = "cuda",
-) -> Optional[torch.Tensor]:
-    """Extract normalized HVG expression from a slice for gene reconstruction.
-
-    Returns:
-        ``(N, n_hvg)`` tensor on device, or ``None`` on failure.
-    """
-    try:
-        if "highly_variable" in slice_obj.var.columns:
-            hvg_mask = slice_obj.var["highly_variable"].values
-            raw = slice_obj[:, hvg_mask].X
-        else:
-            raw = slice_obj.X
-
-        if scipy.sparse.issparse(raw):
-            raw = raw.toarray()
-        raw = raw.astype(np.float32)
-
-        # Take top n_hvg by variance
-        if raw.shape[1] > n_hvg:
-            var = np.var(raw, axis=0)
-            top_idx = np.argsort(var)[-n_hvg:]
-            raw = raw[:, top_idx]
-
-        # Per-gene z-score
-        mean = raw.mean(axis=0)
-        std_val = raw.std(axis=0) + 1e-8
-        raw_norm = (raw - mean) / std_val
-
-        return torch.tensor(raw_norm, device=device)
-    except Exception as e:
-        print(f"  [WARN] Failed to prepare gene expression: {e}")
-        return None
-
-
 def run_ours(
     slice1,
     slice2,
     config: PipelineConfig,
     device: str = "cuda",
     label_key: str = "original_domain",
-    splane_emb2_np: Optional[np.ndarray] = None,
-    dataset_folder: str = "DLPFC_sample1",
-    sample_id2: Optional[str] = None,
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Our method: adaptive_icp + INR deformation.
+) -> Tuple[np.ndarray, np.ndarray, float, Optional["ExprINR"]]:
+    """Our method: adaptive ICP + two-phase DeformNet with ExprINR.
 
     Returns:
-        ``(coords2_rigid_denorm, coords2_final, elapsed_time)``.
+        ``(coords2_rigid_denorm, coords2_final, elapsed_time, inr1)``.
     """
     # Preprocessing
     for ad_ in [slice1, slice2]:
@@ -333,101 +211,46 @@ def run_ours(
     emb1 = torch.tensor(slice1.obsm[config.pca_key].astype(np.float32), device=device)
     emb2 = torch.tensor(slice2.obsm[config.pca_key].astype(np.float32), device=device)
 
-    # --- Splane embeddings ---
-    splane_emb2 = None
-    if splane_emb2_np is not None:
-        splane_emb2 = torch.tensor(splane_emb2_np, device=device)
-        print(f"  Splane embeddings loaded: {splane_emb2.shape}")
-    elif sample_id2 is not None:
-        sp = _load_splane_embeddings(slice2, sample_id2, config.data_dir, dataset_folder)
-        if sp is not None:
-            splane_emb2 = torch.tensor(sp, device=device)
-            print(f"  Splane embeddings loaded: {splane_emb2.shape}")
-        else:
-            print(f"  [WARN] Splane embeddings not found for {sample_id2}")
+    # HVG expression for reconstruction target (log-normalized)
+    import scipy.sparse as sp
+    hvg_mask1 = slice1.var["highly_variable"].values
+    hvg_mask2 = slice2.var["highly_variable"].values
+    X1_hvg = slice1.X[:, hvg_mask1]
+    X2_hvg = slice2.X[:, hvg_mask2]
+    if sp.issparse(X1_hvg):
+        X1_hvg = X1_hvg.toarray()
+    if sp.issparse(X2_hvg):
+        X2_hvg = X2_hvg.toarray()
+    hvg1 = torch.tensor(X1_hvg.astype(np.float32), device=device)
+    hvg2 = torch.tensor(X2_hvg.astype(np.float32), device=device)
 
-    # Determine if embedding head should be active
-    has_splane = splane_emb2 is not None
-    emb_dim = config.model.emb_dim if has_splane else 0
-
-    # Model (with embedding head if Splane available)
-    model = DeformationNet(
-        config.model,
-        emb_dim=emb_dim,
-    ).to(device)
-
+    # DeformNet (spatial only)
+    model = DeformationNet(config.model).to(device)
     matcher = UnifiedCostMatcher(config.matcher)
 
-    # --- Gene reconstruction ---
-    gene_decoder = None
-    gene_expr2_gt = None
-    slice_ids2 = None
-    if has_splane and config.train.lam_recon > 0:
-        gene_expr2_gt = _prepare_gene_expr(slice2, n_hvg=config.expr_field.n_hvg, device=device)
-        if gene_expr2_gt is not None:
-            n_genes = gene_expr2_gt.shape[1]
-            gd = config.gene_decoder
-            gene_decoder = GeneDecoder(
-                emb_dim=emb_dim,
-                batch_dim=gd.batch_dim,
-                hidden=gd.hidden,
-                layers=gd.layers,
-                n_genes=n_genes,
-                n_slices=2,
-            ).to(device)
-            # Source slice = slice_id 1
-            slice_ids2 = torch.ones(slice2.shape[0], dtype=torch.long, device=device)
-            print(f"  GeneDecoder: emb_dim={emb_dim}, n_genes={n_genes}")
-
-    # ExprField (legacy joint training)
-    expr_field = None
-    expr2_gt = None
-    if config.use_expr_field:
-        from inr_align.run import _prepare_expr_field
-        expr_field, expr2_gt = _prepare_expr_field(slice1, slice2, config, device)
+    # Joint components (INR1 + INR2 + decoder)
+    jcfg = config.joint
+    jcfg.n_output = hvg1.shape[1]      # HVG count for decoder output
+    models = build_joint_models(jcfg, device=device)
 
     result = train(
-        model, matcher, x1, emb1, x2, emb2, config.train,
-        expr_field=expr_field,
-        expr2_gt=expr2_gt,
-        lam_expr=config.expr_field.lam_expr if config.use_expr_field else 0.0,
-        splane_emb2=splane_emb2,
-        gene_decoder=gene_decoder,
-        gene_expr2_gt=gene_expr2_gt,
-        slice_ids2=slice_ids2,
+        model, matcher, x1, emb1, x2, emb2,
+        config.train, jcfg,
+        inr1=models["inr1"],
+        inr2=models["inr2"],
+        decoder=models["decoder"],
+        hvg1=hvg1,
+        hvg2=hvg2,
     )
 
-    # Apply deformation
-    model.eval()
-
     # Apply deformation and denormalize
+    model.eval()
     x2_def = apply_model(model, x2)
     coords2_final = x2_def.cpu().numpy() * std + mean
-
     coords2_rigid_denorm = coords2_rigid * std + mean
 
     elapsed = time.time() - start
-
-    return coords2_rigid_denorm, coords2_final, elapsed
-
-
-def run_ours_joint(
-    slice1,
-    slice2,
-    config: PipelineConfig,
-    jcfg: Optional[JointConfig] = None,
-    device: str = "cuda",
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Our method with decoupled joint architecture (Encoder+Decoder+Discriminator).
-
-    Drop-in replacement for ``run_ours`` using the new joint training loop.
-
-    Returns:
-        ``(coords2_rigid_denorm, coords2_final, elapsed_time)``.
-    """
-    if jcfg is None:
-        jcfg = JointConfig()
-    return align_pair_joint(slice1, slice2, config, jcfg, device)
+    return coords2_rigid_denorm, coords2_final, elapsed, result.inr1, (mean, std)
 
 
 # ============================================================================
@@ -443,12 +266,9 @@ def benchmark_all(
     label_map: Optional[Dict] = None,
     run_paste: bool = True,
     run_spateo: bool = True,
-    run_spacel: bool = True,
     run_stalign: bool = True,
     sample_id_groups: Optional[List[List[str]]] = None,
     dataset_folders: Optional[List[str]] = None,
-    run_joint: bool = False,
-    joint_config: Optional[JointConfig] = None,
 ) -> pd.DataFrame:
     """Run all methods on all sample groups.
 
@@ -462,7 +282,6 @@ def benchmark_all(
             ``None`` uses generic label equality.
         run_paste: Whether to include PASTE baseline.
         run_spateo: Whether to include Spateo baseline.
-        run_spacel: Whether to include SPACEL baseline.
         run_stalign: Whether to include STalign baseline.
         sample_id_groups: ``sample_id_groups[j][i]`` is the sample ID string
             for group *j*, slice *i*.  Used to load Splane embeddings.
@@ -470,13 +289,17 @@ def benchmark_all(
             (e.g. ``"DLPFC_sample1"``) for group *j*.
 
     Returns:
-        DataFrame with columns ``[Sample, Pair, Method, Time, Accuracy,
-        Accuracy_NN, Ratio, CLC, LISI, Silhouette, Chamfer]``.
+        ``(DataFrame, encoders_dict)`` where DataFrame has columns
+        ``[Sample, Pair, Method, Time, Accuracy, Accuracy_NN, Ratio,
+        CLC, LISI, Silhouette, Chamfer]`` and ``encoders_dict`` maps
+        ``(sample_idx, pair_idx)`` to the trained ``ExprINR``.
     """
     if config is None:
         config = PipelineConfig()
 
     rows = []
+    inr_models: Dict[Tuple[int, int], ExprINR] = {}
+    norm_params: Dict[Tuple[int, int], Tuple] = {}  # (mean, std) per pair
 
     for j in range(len(layer_groups)):
         for i in range(len(layer_groups[j]) - 1):
@@ -529,14 +352,6 @@ def benchmark_all(
                 except Exception as e:
                     print(f"  PASTE failed: {e}")
 
-            # --- SPACEL ---
-            if run_spacel:
-                try:
-                    c1_sc, c2_sc, t_sc = run_spacel_baseline(s1.copy(), s2.copy(), label_key)
-                    rows.append(_make_row("SPACEL", t_sc, c2_sc, c1_ref=c1_sc))
-                except Exception as e:
-                    print(f"  SPACEL failed: {e}")
-
             # --- STalign ---
             if run_stalign:
                 try:
@@ -556,42 +371,22 @@ def benchmark_all(
                 except Exception as e:
                     print(f"  Spateo failed: {e}")
 
-            # --- Ours ---
+            # --- Ours (two-phase DeformNet + ExprINR) ---
             try:
-                _sid2 = None
-                _dfolder = None
-                if sample_id_groups is not None and j < len(sample_id_groups):
-                    _sid2 = sample_id_groups[j][i + 1]
-                if dataset_folders is not None and j < len(dataset_folders):
-                    _dfolder = dataset_folders[j]
-
-                c2_rigid_o, c2_final_o, t_o = run_ours(
+                c2_rigid_o, c2_final_o, t_o, inr1, norm_ms = run_ours(
                     s1.copy(), s2.copy(), config, device, label_key,
-                    dataset_folder=_dfolder or "DLPFC_sample1",
-                    sample_id2=_sid2,
                 )
                 rows.append(_make_row("INSTA-Rigid", t_o, c2_rigid_o))
                 rows.append(_make_row("INSTA-Nonrigid", t_o, c2_final_o))
+                if inr1 is not None:
+                    inr_models[(j, i)] = inr1
+                    norm_params[(j, i)] = norm_ms
             except Exception as e:
                 print(f"  Ours failed: {e}")
                 import traceback
                 traceback.print_exc()
 
-            # --- Ours (Joint: Encoder + Decoder + Discriminator) ---
-            if run_joint:
-                try:
-                    jcfg = joint_config if joint_config is not None else JointConfig()
-                    c2_rigid_j, c2_final_j, t_j = run_ours_joint(
-                        s1.copy(), s2.copy(), config, jcfg, device,
-                    )
-                    rows.append(_make_row("INSTA-Joint-Rigid", t_j, c2_rigid_j))
-                    rows.append(_make_row("INSTA-Joint-Nonrigid", t_j, c2_final_j))
-                except Exception as e:
-                    print(f"  Ours (Joint) failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), inr_models, norm_params
 
 
 # ============================================================================
@@ -658,7 +453,7 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
     """Grouped bar chart comparing all methods across metrics."""
 
     method_order = [
-        "No-align", "PASTE", "SPACEL", "STalign",
+        "No-align", "PASTE", "STalign",
         "Spateo_Rigid", "Spateo_Nonrigid",
         "INSTA-Rigid", "INSTA-Nonrigid",
     ]
@@ -666,7 +461,7 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
 
     # Per-method colours
     palette = {
-        "No-align": "#999999", "PASTE": "#e6a532", "SPACEL": "#5ba355",
+        "No-align": "#999999", "PASTE": "#e6a532",
         "STalign": "#d35b5b", "Spateo_Rigid": "#7caed6", "Spateo_Nonrigid": "#4a86b8",
         "INSTA-Rigid": "#d98cd9", "INSTA-Nonrigid": "#9933cc",
     }
@@ -742,7 +537,6 @@ def benchmark_dataset(
     label_key: str = "original_domain",
     run_paste: bool = True,
     run_spateo: bool = True,
-    run_spacel: bool = True,
     run_stalign: bool = True,
 ) -> pd.DataFrame:
     """Run all methods on a single dataset (sample_data format).
@@ -782,11 +576,11 @@ def benchmark_dataset(
 
     # Wrap as single group for benchmark_all
     layer_groups = [slices]
-    df = benchmark_all(
+    df, *_ = benchmark_all(
         layer_groups, config, device=device,
         label_key=label_key, label_map=None,
         run_paste=run_paste, run_spateo=run_spateo,
-        run_spacel=run_spacel, run_stalign=run_stalign,
+        run_stalign=run_stalign,
     )
     # Rename Sample column -> Dataset
     df["Dataset"] = dataset
@@ -835,7 +629,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}\n")
 
-    df = benchmark_all(layer_groups, config, device=device)
+    df, *_ = benchmark_all(layer_groups, config, device=device)
     print_summary(df)
     plot_comparison(df, "benchmark_results.png")
 

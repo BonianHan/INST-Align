@@ -28,18 +28,15 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import scanpy as sc
-import scipy.sparse
 import torch
-import torch.nn.functional as F
 
 from inr_align.config import SLICE_ORDER, DLPFC_SAMPLE_GROUPS, PipelineConfig
-from inr_align.loss import compute_P_matrix
 from inr_align.metrics import compute_istbench_metrics, mapping_accuracy_paste, coords_to_pi
 from inr_align.model import (
-    DeformationNet, ExprField, GeneDecoder, UnifiedCostMatcher, adaptive_icp,
-    normalize_expression,
+    DeformationNet, UnifiedCostMatcher, adaptive_icp,
+    build_joint_models, build_knn_graph,
 )
-from inr_align.train import TrainResult, apply_model, train
+from inr_align.engine import TrainResult, apply_model, train
 from inr_align.utils import detect_grid_spacing, denormalize_coordinates, normalize_coordinates
 
 
@@ -100,53 +97,6 @@ def preprocess_slices(
 # ============================================================================
 
 
-def _prepare_expr_field(
-    ref_slice: ad.AnnData,
-    src_slice: ad.AnnData,
-    config: PipelineConfig,
-    device: str,
-) -> Tuple[Optional[ExprField], Optional[torch.Tensor]]:
-    """Create a fresh ExprField and prepare source expression for joint training.
-
-    Returns:
-        ``(expr_field, expr2_gt)`` or ``(None, None)`` if disabled.
-    """
-    if not config.use_expr_field:
-        return None, None
-
-    ef_config = config.expr_field
-
-    # Shared HVG set
-    hvg_mask = ref_slice.var["highly_variable"].values
-
-    expr_arrays = []
-    for s in [ref_slice, src_slice]:
-        raw = s[:, hvg_mask].X
-        if scipy.sparse.issparse(raw):
-            raw = raw.toarray()
-        expr_arrays.append(raw.astype(np.float32))
-
-    # Select top-variance genes
-    n_hvg = min(ef_config.n_hvg, expr_arrays[0].shape[1])
-    pooled_var = sum(np.var(e, axis=0) for e in expr_arrays)
-    top_idx = np.argsort(pooled_var)[-n_hvg:]
-
-    # Global normalization stats
-    all_expr = np.vstack([e[:, top_idx] for e in expr_arrays])
-    all_expr_t = torch.tensor(all_expr, device=device)
-    _, norm_stats = normalize_expression(all_expr_t, ef_config.norm_method)
-
-    # Source expression (normalized)
-    expr2_sub = torch.tensor(expr_arrays[1][:, top_idx], device=device)
-    expr2_gt, _ = normalize_expression(expr2_sub, ef_config.norm_method, stats=norm_stats)
-
-    # Fresh ExprField (no pretrain — will be trained jointly)
-    expr_field = ExprField(ef_config, n_genes=n_hvg, n_slices=1).to(device)
-    print(f"  ExprField: {n_hvg} genes, joint training (lam_expr={ef_config.lam_expr})")
-
-    return expr_field, expr2_gt
-
-
 def align_pair(
     ref_slice: ad.AnnData,
     src_slice: ad.AnnData,
@@ -155,10 +105,8 @@ def align_pair(
     grid_info: dict,
     config: PipelineConfig,
     device: str,
-    splane_emb_src: Optional[np.ndarray] = None,
-    pretrained_expr_field: Optional[ExprField] = None,
 ) -> Tuple[np.ndarray, Optional[TrainResult]]:
-    """Align *src_slice* to *ref_slice*.
+    """Align *src_slice* to *ref_slice* using two-phase training.
 
     Args:
         ref_slice: Reference (target) AnnData.
@@ -169,9 +117,6 @@ def align_pair(
             ``origin``.
         config: Pipeline configuration.
         device: ``"cuda"`` or ``"cpu"``.
-        splane_emb_src: ``(N_src, E)`` pre-computed Splane embeddings for
-            source slice (optional). Enables KL + gene recon losses.
-        pretrained_expr_field: Pre-trained ExprField (optional, legacy).
 
     Returns:
         ``(coords_aligned, train_result_or_None)``.  ``train_result``
@@ -188,71 +133,52 @@ def align_pair(
         emb_A=emb_ref_np, emb_B=emb_src_np,
     )
     coords_rigid = ((R @ coords_src.T).T + t).astype(np.float32)
-    print(f"  ICP: angle={angle:.1f}\u00b0, RMSE={rmse:.4f}")
+    print(f"  ICP: angle={angle:.1f}, RMSE={rmse:.4f}")
 
     if rmse < config.icp.icp_threshold:
-        print(f"  \u2713 ICP error < {config.icp.icp_threshold}, skipping neural deformation")
+        print(f"  ICP error < {config.icp.icp_threshold}, skipping neural deformation")
         return denormalize_coordinates(coords_rigid, mean, std), None
 
-    print(f"  \u2192 Running neural deformation...")
+    print(f"  Running neural deformation (two-phase INR)...")
 
     x_ref = torch.tensor(coords_ref.astype(np.float32), device=device)
     x2 = torch.tensor(coords_rigid, device=device)
-    emb_ref = torch.tensor(ref_slice.obsm[config.pca_key].astype(np.float32), device=device)
-    emb2 = torch.tensor(src_slice.obsm[config.pca_key].astype(np.float32), device=device)
+    emb_ref = torch.tensor(emb_ref_np, device=device)
+    emb_src = torch.tensor(emb_src_np, device=device)
 
-    is_grid = grid_info["is_grid"]
+    # HVG expression for reconstruction target (log-normalized)
+    import scipy.sparse as sp
+    hvg_mask_ref = ref_slice.var["highly_variable"].values
+    hvg_mask_src = src_slice.var["highly_variable"].values
+    X_ref_hvg = ref_slice.X[:, hvg_mask_ref]
+    X_src_hvg = src_slice.X[:, hvg_mask_src]
+    if sp.issparse(X_ref_hvg):
+        X_ref_hvg = X_ref_hvg.toarray()
+    if sp.issparse(X_src_hvg):
+        X_src_hvg = X_src_hvg.toarray()
+    hvg_ref = torch.tensor(X_ref_hvg.astype(np.float32), device=device)
+    hvg_src = torch.tensor(X_src_hvg.astype(np.float32), device=device)
 
-    # Determine embedding dimension
-    has_splane = splane_emb_src is not None
-    emb_dim = config.model.emb_dim if has_splane else 0
-
-    model = DeformationNet(
-        config.model,
-        emb_dim=emb_dim,
-    ).to(device)
-
+    # DeformNet (spatial only)
+    model = DeformationNet(config.model).to(device)
     matcher = UnifiedCostMatcher(config.matcher)
 
-    # Splane KL
-    splane_emb2_t = None
-    if has_splane:
-        splane_emb2_t = torch.tensor(splane_emb_src, device=device)
-        print(f"  Splane embeddings: {splane_emb2_t.shape}")
-
-    # Gene reconstruction
-    gene_decoder = None
-    gene_expr2_gt = None
-    slice_ids2 = None
-    if has_splane and config.train.lam_recon > 0:
-        from inr_align.benchmark import _prepare_gene_expr
-        gene_expr2_gt = _prepare_gene_expr(src_slice, n_hvg=config.expr_field.n_hvg, device=device)
-        if gene_expr2_gt is not None:
-            n_genes = gene_expr2_gt.shape[1]
-            gd = config.gene_decoder
-            gene_decoder = GeneDecoder(
-                emb_dim=emb_dim, batch_dim=gd.batch_dim, hidden=gd.hidden,
-                layers=gd.layers, n_genes=n_genes, n_slices=2,
-            ).to(device)
-            slice_ids2 = torch.ones(src_slice.shape[0], dtype=torch.long, device=device)
-            print(f"  GeneDecoder: emb_dim={emb_dim}, n_genes={n_genes}")
-
-    # ExprField (legacy joint training, created fresh per pair)
-    expr_field, expr2_gt = _prepare_expr_field(ref_slice, src_slice, config, device)
+    # Joint components (INR1 + INR2 + decoder)
+    jcfg = config.joint
+    jcfg.n_output = hvg_ref.shape[1]      # HVG count for decoder output
+    models = build_joint_models(jcfg, device=device)
 
     result = train(
-        model, matcher, x_ref, emb_ref, x2, emb2, config.train,
-        expr_field=expr_field,
-        expr2_gt=expr2_gt,
-        lam_expr=config.expr_field.lam_expr if config.use_expr_field else 0.0,
-        splane_emb2=splane_emb2_t,
-        gene_decoder=gene_decoder,
-        gene_expr2_gt=gene_expr2_gt,
-        slice_ids2=slice_ids2,
+        model, matcher, x_ref, emb_ref, x2, emb_src,
+        config.train, jcfg,
+        inr1=models["inr1"],
+        inr2=models["inr2"],
+        decoder=models["decoder"],
+        hvg1=hvg_ref,
+        hvg2=hvg_src,
     )
 
     model.eval()
-
     x2_def = apply_model(model, x2)
     coords_final = denormalize_coordinates(x2_def.cpu().numpy(), mean, std)
 
@@ -470,20 +396,6 @@ def train_dataset(dataset: str, config: PipelineConfig, device: str) -> None:
     else:
         print(f"  Non-grid data: continuous coordinates")
 
-    # Load Splane embeddings (if available)
-    splane_embs = {}
-    if is_dlpfc_original:
-        splane_path = os.path.join(config.data_dir, folder, "splane_embeddings.npz")
-        if os.path.exists(splane_path):
-            splane_data = np.load(splane_path)
-            for sid in slice_names:
-                key = f"emb_{sid}"
-                if key in splane_data:
-                    splane_embs[sid] = splane_data[key].astype(np.float32)
-            print(f"  Splane embeddings loaded: {list(splane_embs.keys())}")
-        else:
-            print(f"  [WARN] Splane embeddings not found at {splane_path}")
-
     # Reference slice (no alignment needed)
     aligned_slices = [slices[0].copy()]
     aligned_slices[0].obsm["spatial_aligned"] = slices[0].obsm[config.spatial_key].copy()
@@ -494,11 +406,8 @@ def train_dataset(dataset: str, config: PipelineConfig, device: str) -> None:
         print(f"  Aligning {slice_names[i]} -> {slice_names[0]}")
         print(f"{'=' * 50}")
 
-        splane_src = splane_embs.get(slice_names[i], None)
-
         coords_aligned, result = align_pair(
             slices[0], slices[i], mean, std, grid_info, config, device,
-            splane_emb_src=splane_src,
         )
 
         aligned = slices[i].copy()

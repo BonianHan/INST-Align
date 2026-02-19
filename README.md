@@ -22,8 +22,7 @@ inr_align/
   benchmark.py            # Multi-method comparison (7 baselines)
 run_test_acc.py           # Benchmark entry point with per-dataset overrides
 benchmark_insta.py        # Quick INSTA-only benchmark with embedding evaluation
-spacel_runner.py          # SPACEL subprocess runner
-extract_splane_emb.py     # Extract Splane embeddings from SPACEL
+extract_splane_emb.py     # Extract Splane embeddings for clustering evaluation
 requirements.txt          # Python dependencies
 ```
 
@@ -80,7 +79,7 @@ print(metrics_df)
 
 ## Benchmark
 
-Compare 8 methods: **No-align**, **PASTE**, **SPACEL**, **STalign**, **Spateo** (rigid + nonrigid), **INSTA** (rigid + nonrigid).
+Compare methods: **No-align**, **PASTE**, **STalign**, **Spateo** (rigid + nonrigid), **INSTA** (rigid + nonrigid).
 
 ### Run full benchmark
 
@@ -89,7 +88,7 @@ Compare 8 methods: **No-align**, **PASTE**, **SPACEL**, **STalign**, **Spateo** 
 python run_test_acc.py --datasets DLPFC
 
 # INSTA only (skip baselines)
-python run_test_acc.py --datasets DLPFC_sample1 --no_paste --no_spateo --no_spacel --no_stalign
+python run_test_acc.py --datasets DLPFC_sample1 --no_paste --no_spateo --no_stalign
 
 # All datasets
 python run_test_acc.py --datasets DLPFC STARMap BaristaSeq

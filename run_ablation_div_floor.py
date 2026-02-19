@@ -41,21 +41,27 @@ def make_config(base: PipelineConfig, dataset: str, ablation: dict) -> PipelineC
     for prefix, overrides in DATASET_OVERRIDES.items():
         if dataset.startswith(prefix):
             for k, v in overrides.items():
-                setattr(cfg.train, k, v)
+                if hasattr(cfg.train, k):
+                    setattr(cfg.train, k, v)
+                elif hasattr(cfg.joint, k):
+                    setattr(cfg.joint, k, v)
             break
     # Ablation overrides
     for k, v in ablation.items():
-        setattr(cfg.train, k, v)
+        if hasattr(cfg.train, k):
+            setattr(cfg.train, k, v)
+        elif hasattr(cfg.joint, k):
+            setattr(cfg.joint, k, v)
     return cfg
 
 
 def run_dlpfc(base_config, device, ablation_name, ablation_params):
     layer_groups = _load_dlpfc_layer_groups(base_config.data_dir)
     cfg = make_config(base_config, "DLPFC", ablation_params)
-    df = benchmark_all(
+    df, *_ = benchmark_all(
         layer_groups, cfg, device=device,
         label_key="original_domain", label_map=DLPFC_LABEL_MAP,
-        run_paste=False, run_spateo=False, run_spacel=False, run_stalign=False,
+        run_paste=False, run_spateo=False, run_stalign=False,
     )
     df["Dataset"] = df["Sample"].map({0: "DLPFC_sample1", 1: "DLPFC_sample2", 2: "DLPFC_sample3"})
     df = df.drop(columns=["Sample"])
@@ -67,7 +73,7 @@ def run_dataset(base_config, device, dataset, ablation_name, ablation_params):
     cfg = make_config(base_config, dataset, ablation_params)
     df = benchmark_dataset(
         dataset, cfg, device=device, label_key="original_domain",
-        run_paste=False, run_spateo=False, run_spacel=False, run_stalign=False,
+        run_paste=False, run_spateo=False, run_stalign=False,
     )
     df["Ablation"] = ablation_name
     return df

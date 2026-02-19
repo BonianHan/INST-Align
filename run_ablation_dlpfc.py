@@ -76,10 +76,8 @@ def load_and_preprocess():
 def make_base_config():
     """Base config with DLPFC-tuned hyperparameters."""
     cfg = PipelineConfig(data_dir=DATA_DIR)
-    cfg.train.lam_jacobian = 0.1
+    cfg.joint.lam_jacobian = 0.1
     cfg.train.warmup_fraction = 0.3
-    cfg.train.lam_kl = 0.0
-    cfg.train.lam_recon = 0.0
     return cfg
 
 
@@ -150,17 +148,11 @@ def main():
     df_a = run_config(slices, cfg_a, "A_baseline", FOLDER)
     all_dfs.append(df_a)
 
-    # ----- B) + gene decoder (Splane KL + recon) -----
-    splane_path = os.path.join(DATA_DIR, FOLDER, "splane_embeddings.npz")
-    if os.path.exists(splane_path):
-        cfg_b = make_base_config()
-        cfg_b.train.lam_kl = 1.0
-        cfg_b.train.lam_recon = 0.5
-        df_b = run_config(slices, cfg_b, "B_gene_decoder", FOLDER)
-        all_dfs.append(df_b)
-    else:
-        print(f"\n  [SKIP] Config B (gene decoder): Splane embeddings not found at {splane_path}")
-        print(f"         Run: conda activate spacel && python extract_splane_emb.py")
+    # ----- B) + higher recon weight -----
+    cfg_b = make_base_config()
+    cfg_b.joint.lam_recon_phase2 = 0.5
+    df_b = run_config(slices, cfg_b, "B_recon_0.5", FOLDER)
+    all_dfs.append(df_b)
 
     # ----- Combine and print -----
     df_all = pd.concat(all_dfs, ignore_index=True)

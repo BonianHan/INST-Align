@@ -46,7 +46,7 @@ def make_config(use_expr_inr: bool = False) -> PipelineConfig:
     config.icp.mode = "icp_only"
     config.train.epochs = 150
     config.train.lr = 1e-3
-    config.train.lam_jacobian = 0.005
+    config.joint.lam_jacobian = 0.005
     config.train.batch_size = 2000
     config.train.topk = 64
     config.train.warmup_fraction = 0.3
@@ -100,7 +100,7 @@ def run_all_benchmarks(config: PipelineConfig, device: str, tag: str) -> pd.Data
                     print(f"  Loaded {sample_id}: {adata.shape}")
                 layer_groups.append(slices)
 
-            df_dlpfc = benchmark_all(
+            df_dlpfc, *_ = benchmark_all(
                 layer_groups, config, device=device,
                 label_key="original_domain", label_map=DLPFC_LABEL_MAP,
                 run_paste=False, run_spateo=False,  # Only run Ours to save time

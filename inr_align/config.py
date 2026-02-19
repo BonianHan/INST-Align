@@ -16,19 +16,32 @@ from typing import Dict, List, Optional
 
 
 # ============================================================================
-# Model
+# Model (DeformationNet — spatial only)
 # ============================================================================
 
 @dataclass
 class ModelConfig:
-    """Deformation network architecture."""
+    """DeformationNet architecture — spatial deformation only.
+
+    Architecture::
+
+        (x, y) -> PE -> Trunk MLP -> SpatialHead -> (dx, dy)
+
+    The SpatialHead outputs per-point displacements with identity-init.
+    Jacobian regularization ensures smooth, volume-preserving deformation.
+    Embedding is handled by the independent ExprINR (see JointConfig).
+    """
 
     d: int = 2
-    hidden: int = 128
-    layers: int = 6
+    hidden: int = 128               # Trunk hidden width
+    layers: int = 6                  # Trunk layers
+
     n_freqs: int = 6
     max_freq_log2: int = 5
-    emb_dim: int = 16           # Embedding head dimension (0 = no embedding head)
+
+    # --- Spatial head ---
+    spatial_head_layers: int = 1     # Small: few layers, low capacity
+    spatial_head_hidden: int = 64
 
 
 # ============================================================================
@@ -59,65 +72,66 @@ class TrainConfig:
     topk: int = 64
     lr: float = 1e-3
     weight_rev: float = 1.0
-    lam_jacobian: float = 0.015
-    full_reverse_interval: int = 1  # Full-coverage reverse loss every N epochs (0 = off)
-    lam_uniqueness: float = 0.1   # Assignment uniqueness loss weight (0 = off)
-    lam_kl: float = 1.0           # Splane embedding KL loss weight (0 = off)
-    lam_recon: float = 0.5        # Gene reconstruction loss weight (0 = off)
+    full_reverse_interval: int = 1   # Full-coverage reverse loss every N epochs (0 = off)
     grad_clip: float = 1.0
     warmup_fraction: float = 0.3
     print_every: int = 10
-    scheduler_patience: int = 50   # ReduceLROnPlateau: epochs without improvement before LR drop
-    scheduler_factor: float = 0.5  # LR multiplied by this factor on plateau
-    scheduler_min_lr: float = 1e-6 # minimum LR floor
+    scheduler_patience: int = 50     # ReduceLROnPlateau: epochs without improvement before LR drop
+    scheduler_factor: float = 0.5    # LR multiplied by this factor on plateau
+    scheduler_min_lr: float = 1e-6   # minimum LR floor
 
 
 # ============================================================================
-# Expression Field (canonical expression field with batch correction)
+# Joint (ExprINR + Decoder)
 # ============================================================================
 
 @dataclass
-class ExprFieldConfig:
-    """Canonical expression field with per-slice batch embeddings.
+class JointConfig:
+    """Hyperparameters for ExprINR / Decoder.
 
-    Architecture::
+    Phase 1 — INR Pretrain (``inr_pretrain_epochs``):
+        Two independent INRs learn spatial expression fields:
+        coords1 → INR1 → emb → SharedDecoder(emb, batch=0) → expr1_hat
+        coords2 → INR2 → emb → SharedDecoder(emb, batch=1) → expr2_hat
 
-        coords (N,2) → PE → concat(batch_emb) → encoder MLP → embedding (latent_dim)
-        → decoder MLP → expression (N, n_genes)
-
-    Setting ``batch_emb=0`` yields batch-corrected canonical predictions.
+    Phase 2 — Joint Alignment (``TrainConfig.epochs``):
+        INR2 frozen.  INR1 + decoder optionally continue training (recon at
+        reduced weight), or fully frozen (``freeze_inr_phase2=True``).
+        P-matrix uses INR1 for both sides (target coordinate space).
+        DeformNet trained: matching + Jacobian + uniqueness.
     """
 
-    # Architecture
-    hidden: int = 256
-    encoder_layers: int = 2          # Number of hidden layers in encoder (PE → embedding)
-    decoder_layers: int = 2          # Number of hidden layers in decoder (embedding → genes)
-    n_freqs: int = 6
-    max_freq_log2: int = 5
-    batch_emb_dim: int = 16          # Per-slice batch embedding dimension
-    latent_dim: int = 32             # Embedding dimension
+    # --- ExprINR (coords -> embedding) ---
+    emb_dim: int = 64               # Bottleneck embedding dimension
+    inr_hidden: int = 256           # INR backbone hidden width
+    inr_layers: int = 4             # INR backbone layers
+    inr_n_freqs: int = 6            # Fourier PE frequencies
+    inr_max_freq_log2: int = 5      # Max frequency (log2) for PE
 
-    # Loss weight (joint training with deformation)
-    lam_expr: float = 1.0            # Weight for expression reconstruction loss
+    # --- INR pretraining ---
+    inr_pretrain_epochs: int = 300  # Phase 1 pretrain epochs
+    inr_pretrain_lr: float = 1e-3   # Learning rate for INR pretraining
+    freeze_inr_phase2: bool = True  # Freeze INR1+decoder in Phase 2 (preserve embedding quality)
 
-    # Expression normalization
-    norm_method: str = "per_gene"
+    # --- Decoder (embedding + slice_id -> expression) ---
+    n_output: int = 2000            # Reconstruction target dim (HVG count, set at runtime)
+    decoder_hidden: int = 256
+    decoder_layers: int = 2
 
-    # Feature selection
-    n_hvg: int = 2000
+    # --- Loss weights ---
+    lam_match: float = 1.0
+    lam_recon: float = 1.0          # Recon weight during Phase 1 pretrain
+    lam_recon_phase2: float = 0.1   # Reduced recon weight during Phase 2 alignment
+    lam_smooth: float = 0.01
+    lam_jacobian: float = 1.0
+    lam_uniqueness: float = 0.1
+    lam_deform_mag: float = 0.1     # Deformation magnitude penalty: ||x_def - x||^2
 
+    # --- Smoothing ---
+    smooth_k: int = 6
 
-# ============================================================================
-# Gene Decoder
-# ============================================================================
-
-@dataclass
-class GeneDecoderConfig:
-    """GeneDecoder architecture (embedding → gene expression)."""
-
-    batch_dim: int = 16       # Per-slice batch embedding dimension
-    hidden: int = 256         # Hidden layer width
-    layers: int = 2           # Number of hidden layers
+    # --- Slices ---
+    n_slices: int = 2
 
 
 # ============================================================================
@@ -167,9 +181,7 @@ class PipelineConfig:
     matcher: MatcherConfig = field(default_factory=MatcherConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     icp: ICPConfig = field(default_factory=ICPConfig)
-    expr_field: ExprFieldConfig = field(default_factory=ExprFieldConfig)
-    gene_decoder: GeneDecoderConfig = field(default_factory=GeneDecoderConfig)
-    use_expr_field: bool = False  # Enable expression field for joint training
+    joint: JointConfig = field(default_factory=JointConfig)
 
 
 # ============================================================================
@@ -216,9 +228,7 @@ def add_pipeline_args(parser: argparse.ArgumentParser) -> None:
         --matcher_tau_init, ...           (MatcherConfig)
         --train_epochs, ...               (TrainConfig)
         --icp_mode, ...                   (ICPConfig)
-        --expr_hidden, ...                (ExprFieldConfig)
-        --gdec_batch_dim, ...             (GeneDecoderConfig)
-        --use_expr_field                  (flag)
+        --joint_decoder_hidden, ...       (JointConfig)
     """
     # Top-level PipelineConfig scalars
     g = parser.add_argument_group("Pipeline")
@@ -230,7 +240,6 @@ def add_pipeline_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--pca_key", type=str, default="X_pca")
     g.add_argument("--n_top_genes", type=int, default=2000)
     g.add_argument("--device", type=str, default="auto", help="auto|cuda|cpu")
-    g.add_argument("--use_expr_field", action="store_true", help="Enable canonical expression field (alignment + batch correction)")
 
     # Sub-configs with prefixes
     g = parser.add_argument_group("Model (DeformationNet)")
@@ -245,11 +254,8 @@ def add_pipeline_args(parser: argparse.ArgumentParser) -> None:
     g = parser.add_argument_group("ICP")
     _add_dataclass_args(g, ICPConfig, prefix="icp_")
 
-    g = parser.add_argument_group("Expression Field")
-    _add_dataclass_args(g, ExprFieldConfig, prefix="expr_")
-
-    g = parser.add_argument_group("Gene Decoder")
-    _add_dataclass_args(g, GeneDecoderConfig, prefix="gdec_")
+    g = parser.add_argument_group("Joint (ExprINR+Decoder)")
+    _add_dataclass_args(g, JointConfig, prefix="joint_")
 
 
 def config_from_args(args: argparse.Namespace) -> PipelineConfig:
@@ -260,16 +266,13 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
                  "spatial_key", "pca_key", "n_top_genes", "device"):
         if hasattr(args, name):
             setattr(config, name, getattr(args, name))
-    if hasattr(args, "use_expr_field"):
-        config.use_expr_field = args.use_expr_field
 
     # Sub-configs
     _set_dataclass_from_args(config.model, args, prefix="model_")
     _set_dataclass_from_args(config.matcher, args, prefix="matcher_")
     _set_dataclass_from_args(config.train, args, prefix="train_")
     _set_dataclass_from_args(config.icp, args, prefix="icp_")
-    _set_dataclass_from_args(config.expr_field, args, prefix="expr_")
-    _set_dataclass_from_args(config.gene_decoder, args, prefix="gdec_")
+    _set_dataclass_from_args(config.joint, args, prefix="joint_")
     return config
 
 
@@ -295,8 +298,7 @@ def print_config(config: PipelineConfig) -> None:
     # Top-level
     print(f"\n  [Pipeline]")
     for name in ("dataset", "data_dir", "output_dir", "label_key",
-                 "spatial_key", "pca_key", "n_top_genes", "device",
-                 "use_expr_field"):
+                 "spatial_key", "pca_key", "n_top_genes", "device"):
         val = getattr(config, name)
         dval = getattr(default, name)
         marker = " *" if val != dval else ""
@@ -306,8 +308,7 @@ def print_config(config: PipelineConfig) -> None:
     _print_section("Matcher", config.matcher, default.matcher)
     _print_section("Training", config.train, default.train)
     _print_section("ICP", config.icp, default.icp)
-    _print_section("Expression Field", config.expr_field, default.expr_field)
-    _print_section("Gene Decoder", config.gene_decoder, default.gene_decoder)
+    _print_section("Joint", config.joint, default.joint)
     print("\n" + "=" * 60)
     print("  (* = non-default)")
     print("=" * 60)

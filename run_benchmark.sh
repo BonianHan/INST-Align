@@ -10,16 +10,15 @@
 # Methods compared:
 #   1. No-align       -- raw coordinates, no alignment
 #   2. PASTE          -- Fused Gromov-Wasserstein (alpha=0.1)
-#   3. SPACEL         -- Scube.align (graph-based)
-#   4. STalign        -- LDDMM diffeomorphic registration
-#   5. Spateo         -- morpho_align rigid + nonrigid
-#   6. Ours           -- adaptive_icp + INR deformation (rigid / spatial)
+#   3. STalign        -- LDDMM diffeomorphic registration
+#   4. Spateo         -- morpho_align rigid + nonrigid
+#   5. Ours           -- adaptive_icp + INR deformation (rigid / spatial)
 #
 # Usage:
 #   bash run_benchmark.sh                              # Full benchmark
 #   bash run_benchmark.sh --no_paste                   # Skip PASTE
 #   bash run_benchmark.sh --no_spateo                  # Skip Spateo
-#   bash run_benchmark.sh --no_spacel --no_stalign     # Skip SPACEL & STalign
+#   bash run_benchmark.sh --no_stalign                  # Skip STalign
 #   bash run_benchmark.sh --quick                      # Ours only (skip all baselines)
 #
 # Results saved to:
@@ -42,7 +41,7 @@ EXTRA_ARGS=()
 for arg in "$@"; do
     case "$arg" in
         --quick)
-            EXTRA_ARGS+=(--no_paste --no_spateo --no_spacel --no_stalign)
+            EXTRA_ARGS+=(--no_paste --no_spateo --no_stalign)
             ;;
         *)
             EXTRA_ARGS+=("$arg")
