@@ -6,9 +6,11 @@ Phase 1 — INR Pretrain (``jcfg.inr_pretrain_epochs`` iterations):
     coords2 → INR2 → emb → SharedDecoder(emb, batch=1) → expr2_hat
 
 Phase 2 — Joint Alignment (``config.epochs`` iterations):
-    INR2 frozen.  INR1 + decoder continue training (recon at reduced weight).
-    P-matrix uses INR1 for both sides (target coordinate space).
-    DeformNet trained: matching + Jacobian + uniqueness.
+    INR2 frozen.  DeformNet learns deformation via matching loss.
+    INR1 + decoder continue learning via recon loss (adapt to deformed coords).
+    P-matrix uses INR1 embeddings (detached) as soft biological prior.
+    As DeformNet improves → x2_def more accurate → INR1 recon on x2_def more meaningful
+    → P-matrix feature_dist more accurate → better matching → virtuous cycle.
 """
 
 from __future__ import annotations
@@ -277,7 +279,7 @@ def train(
             # --- P-matrix features ---
             if use_inr:
                 # Use INR1 for both sides (coords in same space)
-                # Detach from deformnet for INR embedding computation
+                # Detach: embedding is a fixed soft mask for P-matrix, not a gradient path
                 emb2_for_match = F.normalize(inr1(x2_def.detach(), alpha_inr_t), dim=1)
             else:
                 emb2_for_match = emb2_pca_norm[idx]

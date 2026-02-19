@@ -95,10 +95,10 @@ class JointConfig:
         coords2 → INR2 → emb → SharedDecoder(emb, batch=1) → expr2_hat
 
     Phase 2 — Joint Alignment (``TrainConfig.epochs``):
-        INR2 frozen.  INR1 + decoder optionally continue training (recon at
-        reduced weight), or fully frozen (``freeze_inr_phase2=True``).
-        P-matrix uses INR1 for both sides (target coordinate space).
-        DeformNet trained: matching + Jacobian + uniqueness.
+        INR2 frozen.  DeformNet learns deformation via matching loss.
+        INR1 + decoder continue learning via recon loss (adapt to deformed coords).
+        P-matrix uses INR1 embeddings (detached) as soft biological prior.
+        Embedding quality improves as deformed coords approach correct positions.
     """
 
     # --- ExprINR (coords -> embedding) ---
@@ -111,7 +111,7 @@ class JointConfig:
     # --- INR pretraining ---
     inr_pretrain_epochs: int = 300  # Phase 1 pretrain epochs
     inr_pretrain_lr: float = 1e-3   # Learning rate for INR pretraining
-    freeze_inr_phase2: bool = True  # Freeze INR1+decoder in Phase 2 (preserve embedding quality)
+    freeze_inr_phase2: bool = False  # INR1+decoder continue learning via recon loss in Phase 2 (adapt to deformed coords)
 
     # --- Decoder (embedding + slice_id -> expression) ---
     n_output: int = 2000            # Reconstruction target dim (HVG count, set at runtime)
@@ -121,7 +121,7 @@ class JointConfig:
     # --- Loss weights ---
     lam_match: float = 1.0
     lam_recon: float = 1.0          # Recon weight during Phase 1 pretrain
-    lam_recon_phase2: float = 0.1   # Reduced recon weight during Phase 2 alignment
+    lam_recon_phase2: float = 0.5   # Recon weight in Phase 2: keeps INR1 adapting to deformed coords
     lam_smooth: float = 0.01
     lam_jacobian: float = 1.0
     lam_uniqueness: float = 0.1
