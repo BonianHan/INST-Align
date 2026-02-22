@@ -33,14 +33,14 @@ class ModelConfig:
     """
 
     d: int = 2
-    hidden: int = 128               # Trunk hidden width
-    layers: int = 6                  # Trunk layers
+    hidden: int = 128               
+    layers: int = 6                 
 
     n_freqs: int = 6
     max_freq_log2: int = 5
 
     # --- Spatial head ---
-    spatial_head_layers: int = 1     # Small: few layers, low capacity
+    spatial_head_layers: int = 1    
     spatial_head_hidden: int = 64
 
 
@@ -75,7 +75,7 @@ class TrainConfig:
     full_reverse_interval: int = 1   # Full-coverage reverse loss every N epochs (0 = off)
     grad_clip: float = 1.0
     warmup_fraction: float = 0.3
-    print_every: int = 10
+    print_every: int = 50
     scheduler_patience: int = 50     # ReduceLROnPlateau: epochs without improvement before LR drop
     scheduler_factor: float = 0.5    # LR multiplied by this factor on plateau
     scheduler_min_lr: float = 1e-6   # minimum LR floor
@@ -90,15 +90,14 @@ class JointConfig:
     """Hyperparameters for ExprINR / Decoder.
 
     Phase 1 — INR Pretrain (``inr_pretrain_epochs``):
-        Two independent INRs learn spatial expression fields:
-        coords1 → INR1 → emb → SharedDecoder(emb, batch=0) → expr1_hat
-        coords2 → INR2 → emb → SharedDecoder(emb, batch=1) → expr2_hat
+        A single ExprINR learns the spatial expression field on slice 1:
+        coords1 → ExprINR → emb → Decoder(emb) → expr1_hat
 
     Phase 2 — Joint Alignment (``TrainConfig.epochs``):
-        INR2 frozen.  DeformNet learns deformation via matching loss.
-        INR1 + decoder continue learning via recon loss (adapt to deformed coords).
-        P-matrix uses INR1 embeddings (detached) as soft biological prior.
-        Embedding quality improves as deformed coords approach correct positions.
+        Same ExprINR used for both slices (coords in same space).
+        DeformNet learns deformation via matching loss.
+        ExprINR + decoder continue learning via recon loss.
+        P-matrix uses ExprINR embeddings (detached) as soft biological prior.
     """
 
     # --- ExprINR (coords -> embedding) ---
@@ -109,29 +108,22 @@ class JointConfig:
     inr_max_freq_log2: int = 5      # Max frequency (log2) for PE
 
     # --- INR pretraining ---
-    inr_pretrain_epochs: int = 300  # Phase 1 pretrain epochs
+    inr_pretrain_epochs: int = 300  # Phase 1 pretrain epochs (s1 only)
     inr_pretrain_lr: float = 1e-3   # Learning rate for INR pretraining
-    freeze_inr_phase2: bool = False  # INR1+decoder continue learning via recon loss in Phase 2 (adapt to deformed coords)
+    freeze_inr_phase2: bool = False  # ExprINR+decoder continue learning in Phase 2
 
-    # --- Decoder (embedding + slice_id -> expression) ---
+    # --- Decoder (embedding -> expression, no batch info) ---
     n_output: int = 2000            # Reconstruction target dim (HVG count, set at runtime)
     decoder_hidden: int = 256
-    decoder_layers: int = 2
+    decoder_layers: int = 4
 
     # --- Loss weights ---
     lam_match: float = 1.0
     lam_recon: float = 1.0          # Recon weight during Phase 1 pretrain
-    lam_recon_phase2: float = 0.5   # Recon weight in Phase 2: keeps INR1 adapting to deformed coords
-    lam_smooth: float = 0.01
+    lam_recon_phase2: float = 0.1   # Reduced recon weight during Phase 2 alignment
     lam_jacobian: float = 1.0
-    lam_uniqueness: float = 0.1
-    lam_deform_mag: float = 0.1     # Deformation magnitude penalty: ||x_def - x||^2
-
-    # --- Smoothing ---
-    smooth_k: int = 6
-
-    # --- Slices ---
-    n_slices: int = 2
+    lam_uniqueness: float = 0.3     # Assignment uniqueness: prevent many-to-one collapse
+    lam_deform_mag: float = 0.1     # Deformation magnitude penalty
 
 
 # ============================================================================
@@ -337,6 +329,7 @@ SLICE_ORDER: Dict[str, List[str]] = {
     "MERFISH_Brain_S11": ["slices2", "slices1"],
     "MERFISH_Brain_S12": ["slices2", "slices1"],
     "Mouse": ["slices1", "slices2"],
+    "MouseEmbryo": ["slices1", "slices2"],
     "TNBC": ["slices1", "slices2"],
 }
 

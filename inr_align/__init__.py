@@ -28,8 +28,6 @@ from inr_align.model import (
     ExprEncoder,
     ExprINR,
     ExprDecoder,
-    GradientReversalLayer,
-    SliceDiscriminator,
     WindowedPositionalEncoding,
     UnifiedCostMatcher,
     adaptive_icp,
@@ -37,16 +35,12 @@ from inr_align.model import (
     build_knn_graph,
 )
 from inr_align.loss import (
-    adversarial_loss,
-    assignment_uniqueness_loss,
     compute_P_matrix,
     dice_loss,
-    grl_lambda_schedule,
     jacobian_reg,
     matching_loss_joint,
     recon_loss,
     recon_loss_from_emb,
-    spatial_smooth_loss,
 )
 from inr_align.engine import TrainResult, apply_model, apply_model_with_inr, train
 from inr_align.metrics import (
@@ -92,24 +86,18 @@ __all__ = [
     "ExprEncoder",
     "ExprINR",
     "ExprDecoder",
-    "GradientReversalLayer",
-    "SliceDiscriminator",
     "WindowedPositionalEncoding",
     "UnifiedCostMatcher",
     "adaptive_icp",
     "build_joint_models",
     "build_knn_graph",
     # Loss
-    "adversarial_loss",
-    "assignment_uniqueness_loss",
     "compute_P_matrix",
     "dice_loss",
-    "grl_lambda_schedule",
     "jacobian_reg",
     "matching_loss_joint",
     "recon_loss",
     "recon_loss_from_emb",
-    "spatial_smooth_loss",
     # Engine
     "train",
     "apply_model",

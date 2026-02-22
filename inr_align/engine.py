@@ -1,15 +1,15 @@
 """Two-phase training loop and inference utilities.
 
 Phase 1 — INR Pretrain (``jcfg.inr_pretrain_epochs`` iterations):
-    Two independent ExprINRs learn spatial expression fields:
-    coords1 → INR1 → emb → SharedDecoder(emb, batch=0) → expr1_hat
-    coords2 → INR2 → emb → SharedDecoder(emb, batch=1) → expr2_hat
+    A single ExprINR learns the spatial expression field on slice 1 only:
+    coords1 → ExprINR → emb → Decoder(emb) → expr1_hat
 
 Phase 2 — Joint Alignment (``config.epochs`` iterations):
-    INR2 frozen.  DeformNet learns deformation via matching loss.
-    INR1 + decoder continue learning via recon loss (adapt to deformed coords).
-    P-matrix uses INR1 embeddings (detached) as soft biological prior.
-    As DeformNet improves → x2_def more accurate → INR1 recon on x2_def more meaningful
+    DeformNet learns deformation via matching loss.
+    The same ExprINR is used for both slices (coords in same space after rigid).
+    ExprINR + decoder continue learning via recon loss (adapt to deformed coords).
+    P-matrix uses ExprINR embeddings (detached) as soft biological prior.
+    As DeformNet improves → x2_def more accurate → INR recon on x2_def more meaningful
     → P-matrix feature_dist more accurate → better matching → virtuous cycle.
 """
 
@@ -49,13 +49,12 @@ from inr_align.model import (
 class TrainResult:
     """Returned by :func:`train`."""
 
-    model: DeformationNet
+    deform: DeformationNet
     matcher: UnifiedCostMatcher
     best_match_loss: float
     training_time: float
     history: List[Dict[str, float]] = field(default_factory=list)
-    inr1: Optional[Any] = None
-    inr2: Optional[Any] = None
+    expr_inr: Optional[Any] = None
     decoder: Optional[Any] = None
 
 
@@ -65,7 +64,7 @@ class TrainResult:
 
 
 def train(
-    model: DeformationNet,
+    deform: DeformationNet,
     matcher: UnifiedCostMatcher,
     x1: torch.Tensor,
     emb1_pca: torch.Tensor,
@@ -74,32 +73,28 @@ def train(
     config: Optional[TrainConfig] = None,
     jcfg: Optional[JointConfig] = None,
     # --- INR components (None = PCA-only alignment, no embedding) ---
-    inr1: Optional[ExprINR] = None,
-    inr2: Optional[ExprINR] = None,
+    expr_inr: Optional[ExprINR] = None,
     decoder: Optional[ExprDecoder] = None,
     hvg1: Optional[torch.Tensor] = None,
     hvg2: Optional[torch.Tensor] = None,
-    nbr_idx2: Optional[torch.Tensor] = None,
 ) -> TrainResult:
     """Train the deformation network with two-phase INR strategy.
 
     Phase 1 — INR Pretrain (``jcfg.inr_pretrain_epochs``):
-        - Two independent INRs learn spatial expression fields.
-        - coords1 → INR1 → emb → Decoder(emb, batch=0) → expr1_hat
-        - coords2 → INR2 → emb → Decoder(emb, batch=1) → expr2_hat
+        - A single ExprINR learns the spatial expression field on slice 1.
+        - coords1 → ExprINR → emb → Decoder(emb) → expr1_hat
         - Loss: SUICA-style (masked MSE + L1 + Dice).
         - Alpha windowing: coarse-to-fine PE.
 
     Phase 2 — Joint Alignment (``config.epochs``):
-        - INR2 frozen (no longer needed).
-        - INR1 used for both sides (coords in same space after rigid + deform).
-        - P-matrix: spatial_dist + feat_dist(INR1(x2_def), INR1(x1)).
-        - DeformNet + INR1 + decoder trained jointly.
+        - Same ExprINR used for both slices (coords in same space).
+        - P-matrix: spatial_dist + feat_dist(ExprINR(x2_def), ExprINR(x1)).
+        - DeformNet + ExprINR + decoder trained jointly.
         - Recon loss at reduced weight (``lam_recon_phase2``) to preserve
           biological information in embeddings.
 
     Args:
-        model: ``DeformationNet`` (spatial-only, on device).
+        deform: ``DeformationNet`` (spatial-only, on device).
         matcher: ``UnifiedCostMatcher`` instance.
         x1: ``(N1, 2)`` reference coords (normalized, on device).
         emb1_pca: ``(N1, D)`` reference PCA embeddings (on device).
@@ -107,12 +102,10 @@ def train(
         emb2_pca: ``(N2, D)`` source PCA embeddings (on device).
         config: Training hyper-parameters.
         jcfg: Joint config (INR/decoder params + loss weights).
-        inr1: ``ExprINR`` for reference slice (optional, None = PCA-only).
-        inr2: ``ExprINR`` for source slice (optional, None = PCA-only).
+        expr_inr: ``ExprINR`` (single INR for both slices, optional).
         decoder: ``ExprDecoder`` (optional).
         hvg1: ``(N1, G)`` reference HVG expression (decoder recon target).
         hvg2: ``(N2, G)`` source HVG expression (decoder recon target).
-        nbr_idx2: ``(N2, k)`` pre-computed kNN for spatial smooth (unused).
 
     Returns:
         :class:`TrainResult` with best-checkpoint models restored.
@@ -124,11 +117,11 @@ def train(
 
     device = x1.device
     N1, N2 = x1.shape[0], x2.shape[0]
-    n_freqs_deform = model.n_freqs
+    n_freqs_deform = deform.n_freqs
     batch_size = min(config.batch_size, max(N1, N2))
 
-    # Detect INR mode: need both INRs + decoder + HVG data
-    use_inr = (inr1 is not None and inr2 is not None
+    # Detect INR mode: need INR + decoder + HVG data
+    use_inr = (expr_inr is not None
                and decoder is not None
                and hvg1 is not None and hvg2 is not None)
 
@@ -136,96 +129,135 @@ def train(
     emb1_pca_norm = F.normalize(emb1_pca, dim=1)
     emb2_pca_norm = F.normalize(emb2_pca, dim=1)
 
-    # Slice-ID tensors for decoder
-    if use_inr:
-        sid0 = torch.zeros(batch_size, dtype=torch.long, device=device)
-        sid1 = torch.ones(batch_size, dtype=torch.long, device=device)
-
     history: List[Dict[str, float]] = []
     start = time.time()
 
     # ==================================================================
-    # Phase 1: INR Pretrain
+    # Phase 1: Pretrain (INR recon + DeformNet matching, independent)
     # ==================================================================
     if use_inr and jcfg.inr_pretrain_epochs > 0:
-        print(f"\n  Phase 1: INR Pretrain ({jcfg.inr_pretrain_epochs} epochs)")
-        n_freqs_inr = inr1.n_freqs
+        print(f"\n  Phase 1: Pretrain ({jcfg.inr_pretrain_epochs} epochs)"
+              f" — INR recon (s1 only) + DeformNet PCA matching (independent)")
+        n_freqs_inr = expr_inr.n_freqs
 
-        opt_pretrain = torch.optim.Adam(
-            list(inr1.parameters()) + list(inr2.parameters()) + list(decoder.parameters()),
+        # Two independent optimizers
+        opt_inr = torch.optim.Adam(
+            list(expr_inr.parameters()) + list(decoder.parameters()),
             lr=jcfg.inr_pretrain_lr,
         )
+        opt_deform = torch.optim.Adam(
+            deform.parameters(),
+            lr=config.lr,
+        )
+
+        # Save matcher tau so Phase 2 starts fresh
+        tau_before_p1 = matcher.tau
+
+        # Best checkpoint tracking (recon loss for INR)
+        best_recon = float("inf")
+        best_pretrain_states: Dict[str, dict] = {}
+        patience_counter = 0
+        patience_limit = 80  # stop if no improvement for 80 epochs
 
         for ep in range(jcfg.inr_pretrain_epochs):
-            # Coarse-to-fine alpha for INR PE
             warmup_inr = max(jcfg.inr_pretrain_epochs // 3, 1)
+
+            # Coarse-to-fine alpha for INR PE
             alpha_inr = n_freqs_inr * (ep / warmup_inr) if ep < warmup_inr else float(n_freqs_inr)
-            alpha_t = torch.tensor(alpha_inr, device=device)
+            alpha_inr_t = torch.tensor(alpha_inr, device=device)
 
-            opt_pretrain.zero_grad(set_to_none=True)
+            # Coarse-to-fine alpha for DeformNet PE
+            alpha_def = n_freqs_deform * (ep / warmup_inr) if ep < warmup_inr else float(n_freqs_deform)
+            alpha_def_t = torch.tensor(alpha_def, device=device)
 
-            # Sample batch from each slice
+            # Sample batch from slice 1 only (INR pretrain on s1)
             idx1 = torch.randint(0, N1, (batch_size,), device=device)
+
+            # --- (A) INR recon: ExprINR + decoder on slice 1 only ---
+            opt_inr.zero_grad(set_to_none=True)
+            emb1_batch = expr_inr(x1[idx1], alpha_inr_t)
+            L_recon = recon_loss_from_emb(emb1_batch, decoder, hvg1[idx1])
+            L_recon.backward()
+            if config.grad_clip > 0:
+                nn.utils.clip_grad_norm_(expr_inr.parameters(), config.grad_clip)
+                nn.utils.clip_grad_norm_(decoder.parameters(), config.grad_clip)
+            opt_inr.step()
+
+            # --- (B) DeformNet matching (independent, PCA features) ---
+            opt_deform.zero_grad(set_to_none=True)
             idx2 = torch.randint(0, N2, (batch_size,), device=device)
 
-            # Slice 1: INR1 → decoder(batch=0)
-            emb1_batch = inr1(x1[idx1], alpha_t)
-            sid0_b = torch.zeros(idx1.shape[0], dtype=torch.long, device=device)
-            L_recon1 = recon_loss_from_emb(emb1_batch, decoder, sid0_b, hvg1[idx1])
-
-            # Slice 2: INR2 → decoder(batch=1)
-            emb2_batch = inr2(x2[idx2], alpha_t)
-            sid1_b = torch.ones(idx2.shape[0], dtype=torch.long, device=device)
-            L_recon2 = recon_loss_from_emb(emb2_batch, decoder, sid1_b, hvg2[idx2])
-
-            loss = L_recon1 + L_recon2
-            loss.backward()
-
+            x2_def = deform(x2[idx2], alpha_def_t)
+            L_match, _, _ = matching_loss_joint(
+                x2_def, x1, emb2_pca_norm[idx2], emb1_pca_norm,
+                matcher, config.topk, config.weight_rev,
+            )
+            L_match.backward()
             if config.grad_clip > 0:
-                nn.utils.clip_grad_norm_(inr1.parameters(), config.grad_clip)
-                nn.utils.clip_grad_norm_(inr2.parameters(), config.grad_clip)
-                nn.utils.clip_grad_norm_(decoder.parameters(), config.grad_clip)
+                nn.utils.clip_grad_norm_(deform.parameters(), config.grad_clip)
+            opt_deform.step()
 
-            opt_pretrain.step()
+            # Best checkpoint for INR (skip warmup phase)
+            recon_val = L_recon.item()
+            match_val = L_match.item()
+            if ep >= warmup_inr:
+                if recon_val < best_recon:
+                    best_recon = recon_val
+                    best_pretrain_states = {
+                        "expr_inr": {k: v.cpu().clone() for k, v in expr_inr.state_dict().items()},
+                        "decoder": {k: v.cpu().clone() for k, v in decoder.state_dict().items()},
+                    }
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
 
             if ep % config.print_every == 0 or ep == jcfg.inr_pretrain_epochs - 1:
-                print(f"    ep={ep:03d} | recon1={L_recon1.item():.5f} | recon2={L_recon2.item():.5f} | total={loss.item():.5f}")
+                ckpt_marker = " *" if recon_val <= best_recon else ""
+                print(f"    ep={ep:03d} | recon={recon_val:.5f} | match={match_val:.5f} | τ={matcher.tau:.4f}{ckpt_marker}")
 
             history.append({
-                "epoch": -(jcfg.inr_pretrain_epochs - ep),  # negative = pretrain
-                "phase": 1, "recon": loss.item(),
-                "loss": loss.item(), "match": 0.0,
-                "tau": matcher.tau, "lr": jcfg.inr_pretrain_lr,
+                "epoch": -(jcfg.inr_pretrain_epochs - ep),
+                "phase": 1, "recon": recon_val, "match": match_val,
+                "loss": recon_val + match_val, "tau": matcher.tau,
+                "lr": jcfg.inr_pretrain_lr,
             })
 
-        print(f"  Phase 1 done. Final recon: {loss.item():.5f}")
+            # Early stopping (based on INR recon)
+            if ep >= warmup_inr and patience_counter >= patience_limit:
+                print(f"    Early stopping at ep={ep} (no improvement for {patience_limit} epochs)")
+                break
+
+        # Restore best INR checkpoint
+        if best_pretrain_states:
+            expr_inr.load_state_dict({k: v.to(device) for k, v in best_pretrain_states["expr_inr"].items()})
+            decoder.load_state_dict({k: v.to(device) for k, v in best_pretrain_states["decoder"].items()})
+            print(f"  Phase 1 done. Best recon: {best_recon:.5f} (restored)")
+        else:
+            print(f"  Phase 1 done. Final recon: {L_recon.item():.5f}")
+
+        # Reset matcher tau so Phase 2 starts fresh
+        matcher.tau = tau_before_p1
 
     # ==================================================================
     # Phase 2: Joint Alignment
     # ==================================================================
     print(f"\n  Phase 2: Joint Alignment ({config.epochs} epochs)")
 
-    # Freeze INR2 (no longer needed)
-    if use_inr:
-        for p in inr2.parameters():
-            p.requires_grad = False
-        inr2.eval()
-
-    # Optionally freeze INR1 + decoder in Phase 2 (preserve embedding quality)
+    # Optionally freeze ExprINR + decoder in Phase 2 (preserve embedding quality)
     freeze_inr = use_inr and jcfg.freeze_inr_phase2
     if freeze_inr:
-        for p in inr1.parameters():
+        for p in expr_inr.parameters():
             p.requires_grad = False
         for p in decoder.parameters():
             p.requires_grad = False
-        inr1.eval()
+        expr_inr.eval()
         decoder.eval()
-        print("  [INR1 + decoder frozen in Phase 2]")
+        print("  [ExprINR + decoder frozen in Phase 2]")
 
-    # Optimizer: DeformNet + (optionally INR1 + decoder if not frozen)
-    all_params = [{"params": model.parameters(), "lr": config.lr}]
+    # Optimizer: DeformNet + (optionally ExprINR + decoder if not frozen)
+    all_params = [{"params": deform.parameters(), "lr": config.lr}]
     if use_inr and not freeze_inr:
-        all_params.append({"params": inr1.parameters(), "lr": config.lr})
+        all_params.append({"params": expr_inr.parameters(), "lr": config.lr})
         all_params.append({"params": decoder.parameters(), "lr": config.lr})
 
     optimizer = torch.optim.Adam(all_params)
@@ -248,21 +280,20 @@ def train(
 
         # INR alpha (fully open in Phase 2 — INR already pretrained)
         if use_inr:
-            alpha_inr_t = torch.tensor(float(inr1.n_freqs), device=device)
+            alpha_inr_t = torch.tensor(float(expr_inr.n_freqs), device=device)
 
         # Reference embeddings for P-matrix (recomputed each epoch)
         if use_inr:
             with torch.no_grad():
-                emb1_epoch = F.normalize(inr1(x1, alpha_inr_t), dim=1)
+                emb1_epoch = F.normalize(expr_inr(x1, alpha_inr_t), dim=1)
         else:
             emb1_epoch = emb1_pca_norm
 
         perm = torch.randperm(N2, device=device)
         ep_match = 0.0
         ep_recon = 0.0
-        ep_uniq = 0.0
         ep_jac = 0.0
-        ep_dmag = 0.0
+        ep_uniq = 0.0
         ep_total = 0.0
         n_batch = 0
 
@@ -274,13 +305,13 @@ def train(
 
             # --- DeformNet forward (spatial only) ---
             x2_batch = x2[idx].requires_grad_(True)
-            x2_def = model(x2_batch, alpha_t)
+            x2_def = deform(x2_batch, alpha_t)
 
             # --- P-matrix features ---
             if use_inr:
-                # Use INR1 for both sides (coords in same space)
+                # Use same INR for both sides (coords in same space)
                 # Detach: embedding is a fixed soft mask for P-matrix, not a gradient path
-                emb2_for_match = F.normalize(inr1(x2_def.detach(), alpha_inr_t), dim=1)
+                emb2_for_match = F.normalize(expr_inr(x2_def.detach(), alpha_inr_t), dim=1)
             else:
                 emb2_for_match = emb2_pca_norm[idx]
 
@@ -298,28 +329,26 @@ def train(
             # --- 3. Jacobian reg (spatial head only) ---
             L_jac = torch.tensor(0.0, device=device)
             if jcfg.lam_jacobian > 0:
-                L_jac = jacobian_reg(model, x2_batch, alpha_t)
+                L_jac = jacobian_reg(deform, x2_batch, alpha_t)
 
-            # --- 3b. Deformation magnitude penalty ---
+            # --- 4. Deformation magnitude penalty ---
             L_deform_mag = torch.tensor(0.0, device=device)
             if jcfg.lam_deform_mag > 0:
                 displacement = x2_def - x2[idx]
                 L_deform_mag = displacement.pow(2).sum(dim=1).mean()
 
-            # --- 4. Reconstruction loss (INR1 + decoder, reduced weight) ---
-            #     Skip if INR1 is frozen — no trainable params benefit from it
+            # --- 5. Reconstruction loss (ExprINR + decoder, reduced weight) ---
+            #     Skip if INR is frozen — no trainable params benefit from it
             L_recon = torch.tensor(0.0, device=device)
             if use_inr and jcfg.lam_recon_phase2 > 0 and not freeze_inr:
-                # Target slice recon: INR1(x1) → decoder(emb, batch=0)
+                # Target slice recon: ExprINR(x1) → decoder(emb)
                 ref_idx = torch.randint(0, N1, (bs,), device=device)
-                emb1_recon = inr1(x1[ref_idx], alpha_inr_t)
-                sid0_b = torch.zeros(ref_idx.shape[0], dtype=torch.long, device=device)
-                L_recon1 = recon_loss_from_emb(emb1_recon, decoder, sid0_b, hvg1[ref_idx])
+                emb1_recon = expr_inr(x1[ref_idx], alpha_inr_t)
+                L_recon1 = recon_loss_from_emb(emb1_recon, decoder, hvg1[ref_idx])
 
-                # Source slice recon: INR1(x2_def) → decoder(emb, batch=1)
-                emb2_recon = inr1(x2_def.detach(), alpha_inr_t)
-                sid1_b = torch.ones(bs, dtype=torch.long, device=device)
-                L_recon2 = recon_loss_from_emb(emb2_recon, decoder, sid1_b, hvg2[idx])
+                # Source slice recon: ExprINR(x2_def) → decoder(emb)
+                emb2_recon = expr_inr(x2_def.detach(), alpha_inr_t)
+                L_recon2 = recon_loss_from_emb(emb2_recon, decoder, hvg2[idx])
 
                 L_recon = (L_recon1 + L_recon2) / 2.0
 
@@ -332,17 +361,16 @@ def train(
 
             loss.backward()
             if config.grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                nn.utils.clip_grad_norm_(deform.parameters(), config.grad_clip)
                 if use_inr and not freeze_inr:
-                    nn.utils.clip_grad_norm_(inr1.parameters(), config.grad_clip)
+                    nn.utils.clip_grad_norm_(expr_inr.parameters(), config.grad_clip)
                     nn.utils.clip_grad_norm_(decoder.parameters(), config.grad_clip)
             optimizer.step()
 
             ep_match += L_match.item()
             ep_recon += L_recon.item()
-            ep_uniq += L_uniq.item()
             ep_jac += L_jac.item()
-            ep_dmag += L_deform_mag.item()
+            ep_uniq += L_uniq.item()
             ep_total += loss.item()
             n_batch += 1
 
@@ -350,10 +378,10 @@ def train(
         if config.full_reverse_interval > 0 and ep % config.full_reverse_interval == 0:
             optimizer.zero_grad(set_to_none=True)
             x2_all_in = x2.requires_grad_(True)
-            x2_def_all = model(x2_all_in, alpha_t)
+            x2_def_all = deform(x2_all_in, alpha_t)
 
             if use_inr:
-                emb2_fc = F.normalize(inr1(x2_def_all.detach(), alpha_inr_t), dim=1)
+                emb2_fc = F.normalize(expr_inr(x2_def_all.detach(), alpha_inr_t), dim=1)
             else:
                 emb2_fc = emb2_pca_norm
 
@@ -366,29 +394,30 @@ def train(
             loss_rev_full = config.weight_rev * (x1 - target_rev).pow(2).sum(dim=1).mean()
             loss_rev_full.backward()
             if config.grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                nn.utils.clip_grad_norm_(deform.parameters(), config.grad_clip)
             optimizer.step()
 
-        # --- Best checkpoint ---
+        # --- Best checkpoint (match + uniqueness penalty) ---
         avg_match = ep_match / max(n_batch, 1)
-        if avg_match < best_match:
-            best_match = avg_match
+        avg_uniq = ep_uniq / max(n_batch, 1)
+        avg_score = avg_match + jcfg.lam_uniqueness * avg_uniq
+        if avg_score < best_match:
+            best_match = avg_score
             best_states = {
-                "model": {k: v.cpu().clone() for k, v in model.state_dict().items()},
+                "deform": {k: v.cpu().clone() for k, v in deform.state_dict().items()},
             }
             if use_inr and not freeze_inr:
-                best_states["inr1"] = {k: v.cpu().clone() for k, v in inr1.state_dict().items()}
+                best_states["expr_inr"] = {k: v.cpu().clone() for k, v in expr_inr.state_dict().items()}
                 best_states["decoder"] = {k: v.cpu().clone() for k, v in decoder.state_dict().items()}
 
         # --- Scheduler ---
-        scheduler.step(avg_match)
+        scheduler.step(avg_score)
         cur_lr = optimizer.param_groups[0]["lr"]
 
         record = {
             "epoch": ep, "loss": ep_total / max(n_batch, 1),
             "match": avg_match, "tau": matcher.tau, "lr": cur_lr,
             "recon": ep_recon / max(n_batch, 1),
-            "uniq": ep_uniq / max(n_batch, 1),
             "jac": ep_jac / max(n_batch, 1),
             "phase": 2,
         }
@@ -401,12 +430,8 @@ def train(
             parts.append(f"match={avg_match:.5f}")
             if jcfg.lam_jacobian > 0:
                 parts.append(f"jac={ep_jac / max(n_batch, 1):.5f}")
-            if jcfg.lam_deform_mag > 0:
-                parts.append(f"dmag={ep_dmag / max(n_batch, 1):.5f}")
             if use_inr:
                 parts.append(f"recon={ep_recon / max(n_batch, 1):.5f}")
-            if jcfg.lam_uniqueness > 0:
-                parts.append(f"uniq={ep_uniq / max(n_batch, 1):.6f}")
             print(f"  {' | '.join(parts)}")
 
         # Log LR changes
@@ -415,23 +440,22 @@ def train(
             prev_lr = cur_lr
 
     # --- Restore best checkpoint ---
-    if "model" in best_states:
-        model.load_state_dict({k: v.to(device) for k, v in best_states["model"].items()})
+    if "deform" in best_states:
+        deform.load_state_dict({k: v.to(device) for k, v in best_states["deform"].items()})
     if use_inr:
-        if "inr1" in best_states:
-            inr1.load_state_dict({k: v.to(device) for k, v in best_states["inr1"].items()})
+        if "expr_inr" in best_states:
+            expr_inr.load_state_dict({k: v.to(device) for k, v in best_states["expr_inr"].items()})
         if "decoder" in best_states:
             decoder.load_state_dict({k: v.to(device) for k, v in best_states["decoder"].items()})
 
     elapsed = time.time() - start
     return TrainResult(
-        model=model,
+        deform=deform,
         matcher=matcher,
         best_match_loss=best_match,
         training_time=elapsed,
         history=history,
-        inr1=inr1 if use_inr else None,
-        inr2=inr2 if use_inr else None,
+        expr_inr=expr_inr if use_inr else None,
         decoder=decoder if use_inr else None,
     )
 
@@ -443,32 +467,32 @@ def train(
 
 @torch.no_grad()
 def apply_model(
-    model: DeformationNet,
+    deform: DeformationNet,
     x: torch.Tensor,
 ) -> torch.Tensor:
     """Apply the trained deformation network (coordinates only)."""
-    alpha = torch.tensor(float(model.n_freqs), device=x.device)
-    return model(x, alpha)
+    alpha = torch.tensor(float(deform.n_freqs), device=x.device)
+    return deform(x, alpha)
 
 
 @torch.no_grad()
 def apply_model_with_inr(
-    model: DeformationNet,
+    deform: DeformationNet,
     inr: ExprINR,
     x: torch.Tensor,
 ) -> tuple:
     """Apply deformation and get INR embedding, returning ``(x_def, embedding)``.
 
     Args:
-        model: Trained DeformationNet.
+        deform: Trained DeformationNet.
         inr: Trained ExprINR (typically INR1 — target INR).
         x: ``(N, 2)`` coordinates to deform and embed.
 
     Returns:
         ``(x_def, emb)`` — deformed coordinates and INR embeddings.
     """
-    alpha_deform = torch.tensor(float(model.n_freqs), device=x.device)
+    alpha_deform = torch.tensor(float(deform.n_freqs), device=x.device)
     alpha_inr = torch.tensor(float(inr.n_freqs), device=x.device)
-    x_def = model(x, alpha_deform)
+    x_def = deform(x, alpha_deform)
     emb = inr(x_def, alpha_inr)
     return x_def, emb

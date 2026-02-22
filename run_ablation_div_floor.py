@@ -23,9 +23,9 @@ from inr_align.config import PipelineConfig
 warnings.filterwarnings("ignore")
 
 DATASET_OVERRIDES = {
-    "DLPFC": {"lam_jacobian": 0.1, "warmup_fraction": 0.3, "lam_uniqueness": 0.0},
-    "STARMap": {"lam_jacobian": 0.01, "warmup_fraction": 0.4, "lam_uniqueness": 0.1},
-    "BaristaSeq": {"lam_jacobian": 0.01, "warmup_fraction": 0.4, "lam_uniqueness": 0.1},
+    "DLPFC": {"lam_jacobian": 0.1, "warmup_fraction": 0.3},
+    "STARMap": {"lam_jacobian": 0.01, "warmup_fraction": 0.4},
+    "BaristaSeq": {"lam_jacobian": 0.01, "warmup_fraction": 0.4},
 }
 
 ABLATION_CONFIGS = {

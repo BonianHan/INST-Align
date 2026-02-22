@@ -7,10 +7,7 @@ Core losses:
 - ``jacobian_reg`` — SVD-based Jacobian regularization (spatial head only).
 - ``dice_loss`` — Dice loss for sparse zero/nonzero pattern matching.
 - ``recon_loss`` — Dice + masked MSE + L1 reconstruction on HVG expression.
-- ``recon_loss_from_emb`` — same as recon_loss but takes precomputed embeddings.
-- ``adversarial_loss`` — GRL-based batch correction.
-- ``spatial_smooth_loss`` — k-NN embedding smoothing.
-- ``assignment_uniqueness_loss`` — penalizes many-to-one mapping.
+- ``recon_loss_from_emb`` — same as recon_loss but takes precomputed INR embeddings.
 """
 
 from __future__ import annotations
@@ -82,24 +79,31 @@ def jacobian_reg(
     alpha: torch.Tensor,
     eps: float = 1e-6,
     compression_weight: float = 5.0,
+    n_samples: int = 256,
 ) -> torch.Tensor:
-    """Asymmetric SVD-based Jacobian regularization.
+    """Asymmetric SVD-based Jacobian regularization (sampling-based).
 
-    Calls ``model(x, alpha)`` which returns only coordinates (spatial head).
-    The embed_head is NOT in this computation graph, so it receives no
-    Jacobian gradients.
+    Randomly samples ``n_samples`` points from *x* to compute the Jacobian,
+    avoiding the cost of full-batch autograd + SVD.
 
     Penalizes singular values of the Jacobian deviating from 1,
     with compression (sigma < 1) penalized more heavily.
     """
-    x = x.requires_grad_(True)
-    y = model(x, alpha)
-    B, D = x.shape
-    J = torch.zeros(B, D, D, device=x.device)
+    B = x.shape[0]
+    if B > n_samples:
+        idx = torch.randperm(B, device=x.device)[:n_samples]
+        x_sub = x[idx]
+    else:
+        x_sub = x
+
+    x_sub = x_sub.requires_grad_(True)
+    y = model(x_sub, alpha)
+    Bs, D = x_sub.shape
+    J = torch.zeros(Bs, D, D, device=x_sub.device)
     for d in range(D):
         grad_out = torch.zeros_like(y)
         grad_out[:, d] = 1.0
-        J[:, d, :] = torch.autograd.grad(y, x, grad_out, create_graph=True, retain_graph=True)[0]
+        J[:, d, :] = torch.autograd.grad(y, x_sub, grad_out, create_graph=True, retain_graph=True)[0]
 
     svals = torch.clamp(torch.linalg.svdvals(J), min=eps)
     log_svals = torch.log(svals)
@@ -206,10 +210,9 @@ def recon_loss(
     encoder: nn.Module,
     decoder: nn.Module,
     expr_input: torch.Tensor,
-    slice_ids: torch.Tensor,
     expr_target: torch.Tensor,
 ) -> torch.Tensor:
-    """Self-reconstruction: expr -> encoder -> decoder(emb, slice_id) -> expr_hat.
+    """Self-reconstruction: expr -> encoder -> decoder(emb) -> expr_hat.
 
     Uses SUICA-style three-component loss for sparse gene expression:
     1. Masked MSE — only on nonzero entries (get magnitudes right)
@@ -220,12 +223,11 @@ def recon_loss(
         encoder: Expression encoder (input: PCA features or HVG).
         decoder: Expression decoder (output: HVG expression).
         expr_input: ``(N, D_in)`` encoder input (PCA features).
-        slice_ids: ``(N,)`` integer slice indices.
         expr_target: ``(N, D_out)`` reconstruction target (HVG expression,
             log-normalized).
     """
     emb = encoder(expr_input)
-    recon = decoder(emb, slice_ids)
+    recon = decoder(emb)
 
     # 1) MSE only on nonzero entries
     nonzero_mask = (expr_target != 0)
@@ -246,7 +248,6 @@ def recon_loss(
 def recon_loss_from_emb(
     emb: torch.Tensor,
     decoder: nn.Module,
-    slice_ids: torch.Tensor,
     expr_target: torch.Tensor,
 ) -> torch.Tensor:
     """Reconstruction loss from precomputed embeddings.
@@ -257,12 +258,11 @@ def recon_loss_from_emb(
 
     Args:
         emb: ``(N, emb_dim)`` precomputed embeddings from an INR.
-        decoder: ``ExprDecoder`` (embedding + slice_id -> expression).
-        slice_ids: ``(N,)`` integer slice indices (0 or 1).
+        decoder: ``ExprDecoder`` (embedding -> expression, no batch info).
         expr_target: ``(N, G)`` reconstruction target (HVG expression,
             log-normalized).
     """
-    recon = decoder(emb, slice_ids)
+    recon = decoder(emb)
 
     # 1) MSE only on nonzero entries
     nonzero_mask = (expr_target != 0)
@@ -279,64 +279,3 @@ def recon_loss_from_emb(
 
     return mse + l1 + 0.01 * dice
 
-
-# ============================================================================
-# Adversarial loss (GRL-based batch correction)
-# ============================================================================
-
-
-def adversarial_loss(
-    discriminator: nn.Module,
-    emb: torch.Tensor,
-    slice_ids: torch.Tensor,
-) -> torch.Tensor:
-    """Adversarial batch correction loss.
-
-    With GRL built into the discriminator, a single backward pass
-    sends *reversed* gradients to embed_head (fool the discriminator)
-    and *normal* gradients to the discriminator (classify better).
-    """
-    logits = discriminator(emb)
-    return F.cross_entropy(logits, slice_ids)
-
-
-# ============================================================================
-# Spatial smoothing loss
-# ============================================================================
-
-
-def spatial_smooth_loss(
-    emb: torch.Tensor,
-    nbr_idx: torch.Tensor,
-    weight: float = 0.01,
-) -> torch.Tensor:
-    """Mild spatial smoothing: neighbours should have similar embeddings.
-
-    Weight should be small (0.001-0.05) -- just denoise, not aggressive.
-    """
-    emb_nbr = emb[nbr_idx]
-    emb_center = emb.unsqueeze(1)
-    return weight * (emb_center - emb_nbr).pow(2).mean()
-
-
-# ============================================================================
-# GRL lambda schedule
-# ============================================================================
-
-
-def grl_lambda_schedule(
-    epoch: int,
-    total_epochs: int,
-    max_lambda: float = 1.0,
-    warmup_frac: float = 0.3,
-) -> float:
-    """Ramp GRL strength from 0 to ``max_lambda``.
-
-    During warmup, GRL is off (embed_head learns freely).
-    After warmup, ramps linearly to max_lambda.
-    """
-    warmup = int(total_epochs * warmup_frac)
-    if epoch < warmup:
-        return 0.0
-    progress = (epoch - warmup) / max(total_epochs - warmup, 1)
-    return max_lambda * min(progress * 2, 1.0)

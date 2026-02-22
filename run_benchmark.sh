@@ -96,7 +96,6 @@ python -u run_test_acc.py \
     --train_topk 64 \
     --train_lr 0.001 \
     --train_weight_rev 1.0 \
-    --train_grad_clip 2.0 \
     --train_scheduler_patience 30 \
     --train_scheduler_factor 0.5 \
     --train_scheduler_min_lr 1e-6 \

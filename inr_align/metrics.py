@@ -64,9 +64,9 @@ def mapping_accuracy_nn_bidi(
     Computes NN label match in both directions (1→2 and 2→1) and
     returns the average.  This matches the iSTBench R-script metric.
 
-    Also computes **Ratio** = ``abs(log2(min(N1, N2) / n_unique_matches))``
-    which measures many-to-one collapse.  Lower is better (0 = perfect
-    1-to-1 matching).
+    Also computes **Ratio** = ``N_source / N_unique_matched`` following
+    BenchmarkST (Hu et al., Genome Biology 2024).  Optimal value is 1.0
+    (perfect 1-to-1 matching); higher values indicate many-to-one collapse.
 
     Returns:
         ``(accuracy, ratio)``
@@ -88,10 +88,10 @@ def mapping_accuracy_nn_bidi(
 
     accuracy = (match_fwd + match_bwd) / 2.0
 
-    # Ratio: many-to-one collapse measure (iSTBench)
+    # Ratio: many-to-one collapse measure (BenchmarkST)
+    # N_source / N_unique_matched; 1.0 = perfect, >1 = collapse
     n_unique = len(np.unique(idx_fwd))
-    n_min = min(len(c1), len(c2))
-    ratio = float(np.abs(np.log2(n_min / max(n_unique, 1))))
+    ratio = float(len(c1) / max(n_unique, 1))
 
     return accuracy, ratio
 

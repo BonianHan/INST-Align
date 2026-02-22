@@ -51,7 +51,6 @@ def make_config(use_expr_inr: bool = False) -> PipelineConfig:
     config.train.topk = 64
     config.train.warmup_fraction = 0.3
     config.train.weight_rev = 1.0
-    config.train.grad_clip = 2.0
     config.train.scheduler_patience = 30
     config.train.scheduler_factor = 0.5
     config.matcher.lambda_feat = 1.0

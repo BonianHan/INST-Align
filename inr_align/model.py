@@ -3,19 +3,18 @@
 Architecture::
 
     Phase 1 (INR Pretrain):
-        coords1 -> ExprINR1 -> emb -> SharedDecoder(emb, batch=0) -> expr1_hat
-        coords2 -> ExprINR2 -> emb -> SharedDecoder(emb, batch=1) -> expr2_hat
+        coords1 -> ExprINR -> emb -> Decoder(emb) -> expr1_hat
 
     Phase 2 (Joint Alignment):
         coords2 -> DeformNet -> coords2_def
-        INR1(coords1)     -> emb -> P-matrix + Decoder(emb, batch=0) -> expr1_hat
-        INR1(coords2_def) -> emb -> P-matrix + Decoder(emb, batch=1) -> expr2_hat
+        ExprINR(coords1)     -> emb -> P-matrix + Decoder(emb) -> expr1_hat
+        ExprINR(coords2_def) -> emb -> P-matrix + Decoder(emb) -> expr2_hat
 
 Components:
 - ``WindowedPositionalEncoding``: windowed Fourier positional encoding.
 - ``DeformationNet``: spatial-only deformation network.
-- ``ExprINR``: coords -> PE -> MLP -> embedding (per-slice INR).
-- ``ExprDecoder``: embedding + slice_id -> reconstructed expression.
+- ``ExprINR``: coords -> PE -> MLP -> embedding (single INR for both slices).
+- ``ExprDecoder``: embedding -> reconstructed expression (no batch info).
 - ``UnifiedCostMatcher``: adaptive-temperature soft-assignment matcher.
 - ``adaptive_icp``: PCA-guided + full-search ICP for arbitrary rotations.
 """
@@ -30,7 +29,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
-from torch.autograd import Function
 
 from inr_align.config import ICPConfig, JointConfig, MatcherConfig, ModelConfig
 
@@ -176,14 +174,12 @@ class ExprINR(nn.Module):
 
         (x, y) -> WindowedPE -> MLP(LayerNorm+ReLU) -> bottleneck(emb_dim)
 
-    Each slice gets its own ExprINR instance.  The bottleneck embedding
-    is fed to a shared :class:`ExprDecoder` for gene expression
-    reconstruction, supervised by SUICA-style loss (masked MSE + L1 + Dice).
+    A single ExprINR is used for both slices.  Pretrained on slice 1 only
+    (Phase 1), then used for both slices in Phase 2 after rigid alignment
+    brings coordinates into the same space.
 
-    Unlike :class:`ExprEncoder` (PCA -> embedding), this maps **spatial
-    coordinates** to embeddings.  The bottleneck forces the INR to compress
-    spatial gene expression patterns into a low-dimensional representation
-    that naturally captures tissue structure.
+    The bottleneck embedding is fed to an :class:`ExprDecoder` for gene
+    expression reconstruction, supervised by SUICA-style loss.
     """
 
     def __init__(
@@ -217,110 +213,37 @@ class ExprINR(nn.Module):
 
 
 # ============================================================================
-# Gradient Reversal Layer (Ganin et al., 2016)
-# ============================================================================
-
-
-class _GradientReversalFn(Function):
-    @staticmethod
-    def forward(ctx, x, lam):
-        ctx.lam = lam
-        return x.clone()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return -ctx.lam * grad_output, None
-
-
-class GradientReversalLayer(nn.Module):
-    """Reverse gradients during backward pass."""
-
-    def __init__(self, lam: float = 1.0):
-        super().__init__()
-        self.lam = lam
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _GradientReversalFn.apply(x, self.lam)
-
-    def set_lambda(self, lam: float) -> None:
-        self.lam = lam
-
-
-# ============================================================================
 # Expression Decoder (embedding + slice_id -> expression)
 # ============================================================================
 
 
 class ExprDecoder(nn.Module):
-    """MLP: embedding + slice_onehot -> reconstructed expression.
+    """MLP: embedding -> reconstructed expression.
 
-    Slice-onehot lets the decoder absorb batch effects so that the
-    embedding (from DeformationNet's embed_head) stays batch-free.
+    Simple decoder that maps INR bottleneck embeddings to gene expression.
+    No batch/slice information — the INR embedding is the sole input.
     """
 
     def __init__(
         self,
         emb_dim: int = 64,
-        n_slices: int = 2,
         n_output: int = 50,
         hidden: int = 256,
         n_layers: int = 2,
+        **kwargs,  # absorb legacy n_slices
     ):
         super().__init__()
-        self.n_slices = n_slices
         layers = []
-        in_d = emb_dim + n_slices
+        in_d = emb_dim
         for _ in range(n_layers):
             layers += [nn.Linear(in_d, hidden), nn.ReLU()]
             in_d = hidden
         layers.append(nn.Linear(in_d, n_output))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, emb: torch.Tensor, slice_id: torch.Tensor) -> torch.Tensor:
-        """``(N, emb_dim), (N,) -> (N, n_output)``."""
-        onehot = F.one_hot(slice_id, self.n_slices).float()
-        return self.net(torch.cat([emb, onehot], dim=-1))
-
-
-# ============================================================================
-# Slice Discriminator
-# ============================================================================
-
-
-class SliceDiscriminator(nn.Module):
-    """MLP with built-in GRL: embedding -> slice logits.
-
-    ``forward(emb)``: with GRL (reversed grads to encoder/embed_head).
-    ``forward_no_grl(emb)``: without GRL (normal disc training).
-    """
-
-    def __init__(
-        self,
-        emb_dim: int = 64,
-        n_slices: int = 2,
-        hidden: int = 128,
-        n_layers: int = 2,
-    ):
-        super().__init__()
-        self.grl = GradientReversalLayer(lam=1.0)
-        layers = []
-        in_d = emb_dim
-        for _ in range(n_layers):
-            layers += [nn.Linear(in_d, hidden), nn.ReLU()]
-            in_d = hidden
-        layers.append(nn.Linear(in_d, n_slices))
-        self.classifier = nn.Sequential(*layers)
-
     def forward(self, emb: torch.Tensor) -> torch.Tensor:
-        """With gradient reversal."""
-        return self.classifier(self.grl(emb))
-
-    def forward_no_grl(self, emb: torch.Tensor) -> torch.Tensor:
-        """Without GRL."""
-        return self.classifier(emb)
-
-    def set_grl_lambda(self, lam: float) -> None:
-        self.grl.set_lambda(lam)
+        """``(N, emb_dim) -> (N, n_output)``."""
+        return self.net(emb)
 
 
 # ============================================================================
@@ -344,37 +267,31 @@ def build_joint_models(
     config: JointConfig,
     device: str = "cuda",
 ) -> Dict[str, nn.Module]:
-    """Build INR1 + INR2 + shared decoder from config.
+    """Build a single ExprINR + decoder from config.
 
-    Two independent ExprINRs map spatial coordinates to embeddings.
-    A shared ExprDecoder reconstructs gene expression from embeddings
-    with batch_id (0/1) to absorb batch effects.
+    One ExprINR maps spatial coordinates to embeddings for both slices.
+    An ExprDecoder reconstructs gene expression from embeddings without
+    any batch/slice information (STINR-style).
 
     Args:
         config: Joint config with INR/decoder architecture params.
         device: Target device.
 
     Returns:
-        Dict with keys ``"inr1"``, ``"inr2"``, ``"decoder"``.
+        Dict with keys ``"expr_inr"``, ``"decoder"``.
     """
-    inr1 = ExprINR(
-        d_in=2, emb_dim=config.emb_dim,
-        hidden=config.inr_hidden, n_layers=config.inr_layers,
-        n_freqs=config.inr_n_freqs, max_freq_log2=config.inr_max_freq_log2,
-    ).to(device)
-
-    inr2 = ExprINR(
+    expr_inr = ExprINR(
         d_in=2, emb_dim=config.emb_dim,
         hidden=config.inr_hidden, n_layers=config.inr_layers,
         n_freqs=config.inr_n_freqs, max_freq_log2=config.inr_max_freq_log2,
     ).to(device)
 
     dec = ExprDecoder(
-        config.emb_dim, config.n_slices, config.n_output,
-        config.decoder_hidden, config.decoder_layers,
+        emb_dim=config.emb_dim, n_output=config.n_output,
+        hidden=config.decoder_hidden, n_layers=config.decoder_layers,
     ).to(device)
 
-    return {"inr1": inr1, "inr2": inr2, "decoder": dec}
+    return {"expr_inr": expr_inr, "decoder": dec}
 
 
 # ============================================================================

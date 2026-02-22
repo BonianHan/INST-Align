@@ -1,10 +1,10 @@
-"""Multi-method benchmark: PASTE / Spateo / STalign / Ours / No-align.
+"""Multi-method benchmark: PASTE / PASTE2 / GPSA / Spateo / STalign / Ours / No-align.
 
 Compares all methods on the same dataset using seven metrics:
 
 1. **OT Accuracy** — PASTE-style transport-plan weighted label match.
 2. **NN Accuracy** — Bidirectional nearest-neighbour label match (iSTBench-style).
-3. **Ratio** — Many-to-one collapse measure.
+3. **Ratio** — Many-to-one collapse measure (BenchmarkST).
 4. **CLC** — Contextual Label Consistency.
 5. **LISI** — Local Inverse Simpson's Index (domain consistency).
 6. **Silhouette** — Domain separation in aligned space.
@@ -21,6 +21,7 @@ Or import::
 
 from __future__ import annotations
 
+import signal
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -60,6 +61,38 @@ DLPFC_LABEL_MAP = {"L1": 1, "L2": 2, "L3": 3, "L4": 4, "L5": 5, "L6": 6, "WM": 7
 
 
 # ============================================================================
+# Timeout helper (SIGALRM, Linux only)
+# ============================================================================
+
+class _MethodTimeout(Exception):
+    pass
+
+
+def _run_with_timeout(func, *args, timeout: int = 300, method_name: str = "", **kwargs):
+    """Run func(*args, **kwargs) with a hard SIGALRM timeout.
+
+    Returns ``(result, error_str)``.  On timeout or exception, result is None.
+    """
+    def _handler(signum, frame):
+        raise _MethodTimeout(f"{method_name} timed out after {timeout}s")
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout)
+    try:
+        result = func(*args, **kwargs)
+        signal.alarm(0)
+        return result, None
+    except _MethodTimeout as e:
+        return None, str(e)
+    except Exception as e:
+        signal.alarm(0)
+        return None, str(e)
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
+        signal.alarm(0)
+
+
+# ============================================================================
 # Individual method runners — return aligned coordinates + time
 # ============================================================================
 
@@ -80,14 +113,157 @@ def run_paste_baseline(
     pi0 = pst.match_spots_using_spatial_heuristic(
         slice1.obsm["spatial"], slice2.obsm["spatial"], use_ot=True
     )
+    import torch
+    backend = ot.backend.TorchBackend()
+    use_gpu = torch.cuda.is_available()
     start = time.time()
     pi = pst.pairwise_align(
         slice1, slice2,
         alpha=alpha, G_init=pi0, norm=True, verbose=False,
-        use_gpu=True, backend=ot.backend.TorchBackend(),
+        use_gpu=use_gpu, backend=backend,
     )
     elapsed = time.time() - start
     return pi, elapsed
+
+
+def run_paste2_baseline(
+    slice1,
+    slice2,
+    alpha: float = 0.1,
+) -> Tuple[np.ndarray, float]:
+    """PASTE2 partial pairwise alignment (BenchmarkST).
+
+    Returns:
+        ``(pi, elapsed_time)``.  PASTE2 produces a transport plan.
+    """
+    from paste2.model_selection import select_overlap_fraction
+    from paste2.PASTE2 import partial_pairwise_align
+
+    start = time.time()
+    s = select_overlap_fraction(slice1, slice2, alpha=alpha)
+    pi = partial_pairwise_align(
+        slice1, slice2, s, alpha=alpha,
+        armijo=False, dissimilarity="kl", norm=True,
+        return_obj=False, verbose=False,
+    )
+    elapsed = time.time() - start
+    return pi, elapsed
+
+
+def run_gpsa_baseline(
+    slice1,
+    slice2,
+    n_spatial_dims: int = 2,
+    n_latent_gps: int = 5,
+    m_X_per_view: int = 200,
+    m_G: int = 200,
+    n_epochs: int = 500,
+    lr: float = 1e-2,
+    device: str = "cuda",
+) -> Tuple[np.ndarray, float]:
+    """GPSA Gaussian Process Spatial Alignment (BenchmarkST).
+
+    Returns:
+        ``(coords2_aligned, elapsed_time)``.
+    """
+    from gpsa import VariationalGPSA, rbf_kernel
+
+    coords1 = slice1.obsm["spatial"].astype(np.float32)
+    coords2 = slice2.obsm["spatial"].astype(np.float32)
+
+    # Standardize spatial coordinates (GPSA is sensitive to input scale)
+    coords_all_raw = np.concatenate([coords1, coords2], axis=0)
+    sp_mean = coords_all_raw.mean(axis=0)
+    sp_std = coords_all_raw.std(axis=0) + 1e-8
+    coords1_s = (coords1 - sp_mean) / sp_std
+    coords2_s = (coords2 - sp_mean) / sp_std
+
+    # Combine expression data (use PCA if available, else raw)
+    pca_key = "X_pca"
+    if pca_key in slice1.obsm and pca_key in slice2.obsm:
+        Y1 = slice1.obsm[pca_key].astype(np.float32)
+        Y2 = slice2.obsm[pca_key].astype(np.float32)
+        n_features = min(Y1.shape[1], Y2.shape[1])
+        Y1 = Y1[:, :n_features]
+        Y2 = Y2[:, :n_features]
+    else:
+        import scipy.sparse as sp
+        X1 = slice1.X.toarray() if sp.issparse(slice1.X) else np.array(slice1.X)
+        X2 = slice2.X.toarray() if sp.issparse(slice2.X) else np.array(slice2.X)
+        n_features = min(X1.shape[1], X2.shape[1])
+        Y1 = X1[:, :n_features].astype(np.float32)
+        Y2 = X2[:, :n_features].astype(np.float32)
+
+    # Standardize features
+    Y_all = np.concatenate([Y1, Y2], axis=0)
+    y_mean = Y_all.mean(axis=0)
+    y_std = Y_all.std(axis=0) + 1e-8
+    Y1 = (Y1 - y_mean) / y_std
+    Y2 = (Y2 - y_mean) / y_std
+
+    # GPSA expects torch tensors
+    spatial_all = torch.tensor(np.concatenate([coords1_s, coords2_s], axis=0))
+    outputs_all = torch.tensor(np.concatenate([Y1, Y2], axis=0))
+
+    data_dict = {
+        "expression": {
+            "spatial_coords": spatial_all,
+            "outputs": outputs_all,
+            "n_samples_list": [len(coords1), len(coords2)],
+        }
+    }
+
+    n_gps = min(n_latent_gps, n_features)
+    n_min = min(len(coords1), len(coords2))
+
+    model = VariationalGPSA(
+        data_dict,
+        n_spatial_dims=n_spatial_dims,
+        m_X_per_view=min(m_X_per_view, n_min),
+        m_G=min(m_G, n_min),
+        data_init=True,
+        minmax_init=False,
+        grid_init=False,
+        n_latent_gps={"expression": n_gps},
+        mean_function="identity_fixed",
+        kernel_func_warp=rbf_kernel,
+        kernel_func_data=rbf_kernel,
+        fixed_view_idx=0,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    X_spatial = {"expression": spatial_all.to(device)}
+    Y_dict = {"expression": outputs_all.to(device)}
+
+    start = time.time()
+    print_interval = max(1, n_epochs // 5)
+    for ep in range(n_epochs):
+        optimizer.zero_grad()
+        G_means, G_samples, F_latent, F_observed = model.forward(
+            X_spatial, model.view_idx, model.Ns,
+        )
+        loss = model.loss_fn(
+            {"expression": {"outputs": Y_dict["expression"]}},
+            F_observed,
+        )
+        loss.backward()
+        optimizer.step()
+        if ep % print_interval == 0:
+            print(f"    GPSA epoch {ep}/{n_epochs}  loss={loss.item():.4f}")
+    elapsed = time.time() - start
+
+    # Extract aligned coordinates and convert back to original scale
+    with torch.no_grad():
+        model.eval()
+        G_means, *_ = model.forward(
+            X_spatial, model.view_idx, model.Ns,
+        )
+        aligned_coords_s = G_means["expression"].cpu().numpy()
+        n1 = len(coords1)
+        coords2_aligned = aligned_coords_s[n1:] * sp_std + sp_mean
+
+    return coords2_aligned, elapsed
 
 
 def run_spateo_baseline(
@@ -125,7 +301,7 @@ def run_stalign_baseline(
     slice1,
     slice2,
     device: str = "cuda",
-    dx: int = 30,
+    dx: Optional[float] = None,
 ) -> Tuple[np.ndarray, float]:
     """STalign LDDMM diffeomorphic registration.
 
@@ -134,20 +310,40 @@ def run_stalign_baseline(
     """
     from STalign import STalign as STalign_module
 
-    coords1 = slice1.obsm["spatial"]
-    coords2 = slice2.obsm["spatial"]
+    coords1 = slice1.obsm["spatial"].astype(np.float64)
+    coords2 = slice2.obsm["spatial"].astype(np.float64)
+
+    # Scale coordinates to ~1000-unit range so STalign's internal
+    # velocity field parameters (a=500, step=250) work correctly.
+    # Small ranges like DLPFC (~127) cause the velocity grid to
+    # have only 1 point, triggering index-out-of-bounds errors.
+    all_coords = np.vstack([coords1, coords2])
+    max_range = max(
+        all_coords[:, 0].max() - all_coords[:, 0].min(),
+        all_coords[:, 1].max() - all_coords[:, 1].min(),
+    )
+    TARGET_RANGE = 2000.0
+    scale = TARGET_RANGE / max(max_range, 1e-8)
+    offset = all_coords.min(axis=0)
+
+    coords1_s = (coords1 - offset) * scale
+    coords2_s = (coords2 - offset) * scale
+
+    # Auto-compute dx on the scaled coordinates
+    if dx is None:
+        dx = max(TARGET_RANGE / 20.0, 1.0)
 
     # Target = slice1, Source = slice2
-    xJ = np.array(coords1[:, 0])
-    yJ = np.array(coords1[:, 1])
+    xJ = np.array(coords1_s[:, 0])
+    yJ = np.array(coords1_s[:, 1])
     XJ, YJ, J, _ = STalign_module.rasterize(xJ, yJ, dx=dx)
 
-    xI = np.array(coords2[:, 0])
-    yI = np.array(coords2[:, 1])
+    xI = np.array(coords2_s[:, 0])
+    yI = np.array(coords2_s[:, 1])
     XI, YI, I, _ = STalign_module.rasterize(xI, yI, dx=dx)
 
     start = time.time()
-    params = {"niter": 10000, "device": device, "epV": 50}
+    params = {"niter": 3000, "device": device, "epV": 50}
     out = STalign_module.LDDMM([YI, XI], I, [YJ, XJ], J, **params)
     A, v, xv = out["A"], out["v"], out["xv"]
 
@@ -159,7 +355,9 @@ def run_stalign_baseline(
         tpointsI = tpointsI.cpu()
     elapsed = time.time() - start
 
-    coords2_aligned = tpointsI[:, [1, 0]].numpy()
+    # Scale back to original coordinate space
+    aligned_s = tpointsI[:, [1, 0]].numpy()  # (N, 2) in (x, y)
+    coords2_aligned = aligned_s / scale + offset
     return coords2_aligned, elapsed
 
 
@@ -170,10 +368,10 @@ def run_ours(
     device: str = "cuda",
     label_key: str = "original_domain",
 ) -> Tuple[np.ndarray, np.ndarray, float, Optional["ExprINR"]]:
-    """Our method: adaptive ICP + two-phase DeformNet with ExprINR.
+    """Our method: adaptive ICP + two-phase DeformNet with single ExprINR.
 
     Returns:
-        ``(coords2_rigid_denorm, coords2_final, elapsed_time, inr1)``.
+        ``(coords2_rigid_denorm, coords2_final, elapsed_time, expr_inr)``.
     """
     # Preprocessing
     for ad_ in [slice1, slice2]:
@@ -228,7 +426,7 @@ def run_ours(
     model = DeformationNet(config.model).to(device)
     matcher = UnifiedCostMatcher(config.matcher)
 
-    # Joint components (INR1 + INR2 + decoder)
+    # Joint components (single ExprINR + decoder)
     jcfg = config.joint
     jcfg.n_output = hvg1.shape[1]      # HVG count for decoder output
     models = build_joint_models(jcfg, device=device)
@@ -236,8 +434,7 @@ def run_ours(
     result = train(
         model, matcher, x1, emb1, x2, emb2,
         config.train, jcfg,
-        inr1=models["inr1"],
-        inr2=models["inr2"],
+        expr_inr=models["expr_inr"],
         decoder=models["decoder"],
         hvg1=hvg1,
         hvg2=hvg2,
@@ -249,8 +446,19 @@ def run_ours(
     coords2_final = x2_def.cpu().numpy() * std + mean
     coords2_rigid_denorm = coords2_rigid * std + mean
 
+    # --- Coordinate diagnostic ---
+    print(f"  [COORD DEBUG] raw coords1:  x=[{coords1[:,0].min():.1f}, {coords1[:,0].max():.1f}]  y=[{coords1[:,1].min():.1f}, {coords1[:,1].max():.1f}]")
+    print(f"  [COORD DEBUG] raw coords2:  x=[{coords2[:,0].min():.1f}, {coords2[:,0].max():.1f}]  y=[{coords2[:,1].min():.1f}, {coords2[:,1].max():.1f}]")
+    print(f"  [COORD DEBUG] norm mean={mean}, std={std}")
+    print(f"  [COORD DEBUG] c1_norm:      x=[{coords1_norm[:,0].min():.4f}, {coords1_norm[:,0].max():.4f}]  y=[{coords1_norm[:,1].min():.4f}, {coords1_norm[:,1].max():.4f}]")
+    print(f"  [COORD DEBUG] c2_rigid_n:   x=[{coords2_rigid[:,0].min():.4f}, {coords2_rigid[:,0].max():.4f}]  y=[{coords2_rigid[:,1].min():.4f}, {coords2_rigid[:,1].max():.4f}]")
+    x2_def_np = x2_def.cpu().numpy()
+    print(f"  [COORD DEBUG] c2_deform_n:  x=[{x2_def_np[:,0].min():.4f}, {x2_def_np[:,0].max():.4f}]  y=[{x2_def_np[:,1].min():.4f}, {x2_def_np[:,1].max():.4f}]")
+    print(f"  [COORD DEBUG] c2_rigid_de:  x=[{coords2_rigid_denorm[:,0].min():.1f}, {coords2_rigid_denorm[:,0].max():.1f}]  y=[{coords2_rigid_denorm[:,1].min():.1f}, {coords2_rigid_denorm[:,1].max():.1f}]")
+    print(f"  [COORD DEBUG] c2_final_de:  x=[{coords2_final[:,0].min():.1f}, {coords2_final[:,0].max():.1f}]  y=[{coords2_final[:,1].min():.1f}, {coords2_final[:,1].max():.1f}]")
+
     elapsed = time.time() - start
-    return coords2_rigid_denorm, coords2_final, elapsed, result.inr1, (mean, std)
+    return coords2_rigid_denorm, coords2_final, elapsed, result.expr_inr, (mean, std)
 
 
 # ============================================================================
@@ -265,6 +473,8 @@ def benchmark_all(
     label_key: str = "original_domain",
     label_map: Optional[Dict] = None,
     run_paste: bool = True,
+    run_paste2: bool = True,
+    run_gpsa: bool = True,
     run_spateo: bool = True,
     run_stalign: bool = True,
     sample_id_groups: Optional[List[List[str]]] = None,
@@ -281,6 +491,8 @@ def benchmark_all(
         label_map: Optional label -> int mapping for accuracy.
             ``None`` uses generic label equality.
         run_paste: Whether to include PASTE baseline.
+        run_paste2: Whether to include PASTE2 baseline.
+        run_gpsa: Whether to include GPSA baseline.
         run_spateo: Whether to include Spateo baseline.
         run_stalign: Whether to include STalign baseline.
         sample_id_groups: ``sample_id_groups[j][i]`` is the sample ID string
@@ -312,21 +524,38 @@ def benchmark_all(
 
             _coords1 = s1.obsm["spatial"]
             _coords2 = s2.obsm["spatial"]
-            _l1 = np.asarray(s1.obs[label_key])
-            _l2 = np.asarray(s2.obs[label_key])
+            _l1_raw = np.asarray(s1.obs[label_key])
+            _l2_raw = np.asarray(s2.obs[label_key])
+
+            # Filter out NA/nan labels for metric computation
+            _valid1 = np.array([str(l) not in ("NA", "nan", "None", "") for l in _l1_raw])
+            _valid2 = np.array([str(l) not in ("NA", "nan", "None", "") for l in _l2_raw])
+            n_filtered = (~_valid1).sum() + (~_valid2).sum()
+            if n_filtered > 0:
+                print(f"  Filtered {n_filtered} NA labels "
+                      f"(s1: {(~_valid1).sum()}, s2: {(~_valid2).sum()})")
 
             def _make_row(method, t, c2_aligned, c1_ref=None):
                 """Compute all 7 metrics and build result row."""
                 c1 = c1_ref if c1_ref is not None else _coords1
-                pi = coords_to_pi(c1, c2_aligned)
-                acc_ot = mapping_accuracy_paste(s1.obs[label_key], s2.obs[label_key], pi, label_map)
-                acc_nn, ratio = mapping_accuracy_nn_bidi(_l1, _l2, c1, c2_aligned)
-                clc_val = calculate_clc(_l1, _l2, c1, c2_aligned)
-                lisi = compute_lisi(c1, c2_aligned, _l1, _l2)
-                sil = compute_silhouette(c1, c2_aligned, _l1, _l2)
+                # Use filtered labels/coords for label-based metrics
+                c1_f = c1[_valid1]
+                c2_f = c2_aligned[_valid2]
+                l1_f = _l1_raw[_valid1]
+                l2_f = _l2_raw[_valid2]
+                l1_s1 = s1.obs[label_key].iloc[np.where(_valid1)[0]]
+                l2_s2 = s2.obs[label_key].iloc[np.where(_valid2)[0]]
+                pi = coords_to_pi(c1_f, c2_f)
+                acc_ot = mapping_accuracy_paste(l1_s1, l2_s2, pi, label_map)
+                acc_nn, ratio = mapping_accuracy_nn_bidi(l1_f, l2_f, c1_f, c2_f)
+                clc_val = calculate_clc(l1_f, l2_f, c1_f, c2_f)
+                lisi = compute_lisi(c1_f, c2_f, l1_f, l2_f)
+                sil = compute_silhouette(c1_f, c2_f, l1_f, l2_f)
+                # Chamfer uses all points (geometric, no labels)
                 cham = chamfer_distance(c1, c2_aligned)
                 row = {
                     "Sample": j, "Pair": i, "Method": method, "Time": t,
+                    "N1": s1.shape[0], "N2": s2.shape[0],
                     "Accuracy": acc_ot, "Accuracy_NN": acc_nn, "Ratio": ratio,
                     "CLC": clc_val, "LISI": lisi, "Silhouette": sil, "Chamfer": cham,
                 }
@@ -340,25 +569,68 @@ def benchmark_all(
 
             # --- PASTE ---
             if run_paste:
-                try:
-                    pi_paste, t_p = run_paste_baseline(s1.copy(), s2.copy(), alpha=0.1)
-                    # PASTE has no explicit aligned coords; compute NN metrics on original
-                    row_p = _make_row("PASTE", t_p, _coords2)
-                    # Override OT accuracy with PASTE's pi-based value
+                result, err = _run_with_timeout(
+                    run_paste_baseline, s1.copy(), s2.copy(),
+                    timeout=300, method_name="PASTE", alpha=0.1,
+                )
+                if result is not None:
+                    pi_paste, t_p = result
+                    # pi shape: (n1, n2). Transpose so rows = slice2 points,
+                    # then normalize rows to get weighted avg of slice1 coords.
+                    pi_T = pi_paste.T  # (n2, n1)
+                    pi_T_norm = pi_T / (pi_T.sum(1, keepdims=True) + 1e-12)
+                    c2_paste_aligned = pi_T_norm @ _coords1  # (n2, 2)
+                    row_p = _make_row("PASTE", t_p, c2_paste_aligned)
                     row_p["Accuracy"] = mapping_accuracy_paste(
                         s1.obs[label_key], s2.obs[label_key], pi_paste, label_map
                     )
                     rows.append(row_p)
-                except Exception as e:
-                    print(f"  PASTE failed: {e}")
+                else:
+                    print(f"  PASTE skipped: {err}")
+
+            # --- PASTE2 ---
+            if run_paste2:
+                result, err = _run_with_timeout(
+                    run_paste2_baseline, s1.copy(), s2.copy(),
+                    timeout=300, method_name="PASTE2", alpha=0.1,
+                )
+                if result is not None:
+                    pi_paste2, t_p2 = result
+                    # pi shape: (n1, n2). Transpose for slice2 -> slice1 mapping.
+                    pi2_T = pi_paste2.T  # (n2, n1)
+                    pi2_T_norm = pi2_T / (pi2_T.sum(1, keepdims=True) + 1e-12)
+                    c2_paste2_aligned = pi2_T_norm @ _coords1  # (n2, 2)
+                    row_p2 = _make_row("PASTE2", t_p2, c2_paste2_aligned)
+                    row_p2["Accuracy"] = mapping_accuracy_paste(
+                        s1.obs[label_key], s2.obs[label_key], pi_paste2, label_map
+                    )
+                    rows.append(row_p2)
+                else:
+                    print(f"  PASTE2 skipped: {err}")
+
+            # --- GPSA ---
+            if run_gpsa:
+                result, err = _run_with_timeout(
+                    run_gpsa_baseline, s1.copy(), s2.copy(),
+                    timeout=600, method_name="GPSA", device=device,
+                )
+                if result is not None:
+                    c2_gpsa, t_gpsa = result
+                    rows.append(_make_row("GPSA", t_gpsa, c2_gpsa))
+                else:
+                    print(f"  GPSA skipped: {err}")
 
             # --- STalign ---
             if run_stalign:
-                try:
-                    c2_st, t_st = run_stalign_baseline(s1.copy(), s2.copy(), device)
+                result, err = _run_with_timeout(
+                    run_stalign_baseline, s1.copy(), s2.copy(),
+                    timeout=600, method_name="STalign", device=device,
+                )
+                if result is not None:
+                    c2_st, t_st = result
                     rows.append(_make_row("STalign", t_st, c2_st))
-                except Exception as e:
-                    print(f"  STalign failed: {e}")
+                else:
+                    print(f"  STalign skipped: {err}")
 
             # --- Spateo ---
             if run_spateo:
@@ -373,13 +645,13 @@ def benchmark_all(
 
             # --- Ours (two-phase DeformNet + ExprINR) ---
             try:
-                c2_rigid_o, c2_final_o, t_o, inr1, norm_ms = run_ours(
+                c2_rigid_o, c2_final_o, t_o, expr_inr_o, norm_ms = run_ours(
                     s1.copy(), s2.copy(), config, device, label_key,
                 )
                 rows.append(_make_row("INSTA-Rigid", t_o, c2_rigid_o))
                 rows.append(_make_row("INSTA-Nonrigid", t_o, c2_final_o))
-                if inr1 is not None:
-                    inr_models[(j, i)] = inr1
+                if expr_inr_o is not None:
+                    inr_models[(j, i)] = expr_inr_o
                     norm_params[(j, i)] = norm_ms
             except Exception as e:
                 print(f"  Ours failed: {e}")
@@ -453,7 +725,7 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
     """Grouped bar chart comparing all methods across metrics."""
 
     method_order = [
-        "No-align", "PASTE", "STalign",
+        "No-align", "PASTE", "PASTE2", "GPSA", "STalign",
         "Spateo_Rigid", "Spateo_Nonrigid",
         "INSTA-Rigid", "INSTA-Nonrigid",
     ]
@@ -461,8 +733,9 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
 
     # Per-method colours
     palette = {
-        "No-align": "#999999", "PASTE": "#e6a532",
-        "STalign": "#d35b5b", "Spateo_Rigid": "#7caed6", "Spateo_Nonrigid": "#4a86b8",
+        "No-align": "#999999", "PASTE": "#e6a532", "PASTE2": "#c4882a",
+        "GPSA": "#5cb85c", "STalign": "#d35b5b",
+        "Spateo_Rigid": "#7caed6", "Spateo_Nonrigid": "#4a86b8",
         "INSTA-Rigid": "#d98cd9", "INSTA-Nonrigid": "#9933cc",
     }
 
@@ -536,6 +809,8 @@ def benchmark_dataset(
     device: str = "cuda",
     label_key: str = "original_domain",
     run_paste: bool = True,
+    run_paste2: bool = True,
+    run_gpsa: bool = True,
     run_spateo: bool = True,
     run_stalign: bool = True,
 ) -> pd.DataFrame:
@@ -566,7 +841,7 @@ def benchmark_dataset(
     # Check label_key exists
     if label_key not in slices[0].obs.columns:
         # Try common alternatives
-        for alt in ["original_domain", "cell_type", "celltype", "cluster", "label"]:
+        for alt in ["original_domain", "cellbin_SpatialDomain", "cell_type", "celltype", "cluster", "label"]:
             if alt in slices[0].obs.columns:
                 label_key = alt
                 break
@@ -579,7 +854,8 @@ def benchmark_dataset(
     df, *_ = benchmark_all(
         layer_groups, config, device=device,
         label_key=label_key, label_map=None,
-        run_paste=run_paste, run_spateo=run_spateo,
+        run_paste=run_paste, run_paste2=run_paste2,
+        run_gpsa=run_gpsa, run_spateo=run_spateo,
         run_stalign=run_stalign,
     )
     # Rename Sample column -> Dataset

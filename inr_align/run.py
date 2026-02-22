@@ -100,21 +100,16 @@ def preprocess_slices(
 def align_pair(
     ref_slice: ad.AnnData,
     src_slice: ad.AnnData,
-    mean: np.ndarray,
-    std: np.ndarray,
-    grid_info: dict,
     config: PipelineConfig,
     device: str,
 ) -> Tuple[np.ndarray, Optional[TrainResult]]:
     """Align *src_slice* to *ref_slice* using two-phase training.
 
+    Normalization is computed pairwise (ref + src only), not globally.
+
     Args:
         ref_slice: Reference (target) AnnData.
         src_slice: Source AnnData.
-        mean: Global coordinate mean.
-        std: Global coordinate std.
-        grid_info: Dict with ``spacing_x``, ``spacing_y``, ``is_grid``,
-            ``origin``.
         config: Pipeline configuration.
         device: ``"cuda"`` or ``"cpu"``.
 
@@ -122,8 +117,15 @@ def align_pair(
         ``(coords_aligned, train_result_or_None)``.  ``train_result``
         is ``None`` when ICP alone was sufficient.
     """
-    coords_ref = (ref_slice.obsm[config.spatial_key] - mean) / std
-    coords_src = (src_slice.obsm[config.spatial_key] - mean) / std
+    coords1_raw = ref_slice.obsm[config.spatial_key]
+    coords2_raw = src_slice.obsm[config.spatial_key]
+    [coords_ref, coords_src], mean, std = normalize_coordinates([coords1_raw, coords2_raw])
+
+    spacing_x, spacing_y, is_grid, origin = detect_grid_spacing(coords_ref)
+    if is_grid:
+        print(f"  Grid detected: spacing=({spacing_x:.4f}, {spacing_y:.4f})")
+    else:
+        print(f"  Non-grid data: continuous coordinates")
 
     # Adaptive ICP rigid alignment (with expression-guided rotation selection)
     emb_ref_np = ref_slice.obsm[config.pca_key].astype(np.float32)
@@ -163,7 +165,7 @@ def align_pair(
     model = DeformationNet(config.model).to(device)
     matcher = UnifiedCostMatcher(config.matcher)
 
-    # Joint components (INR1 + INR2 + decoder)
+    # Joint components (single ExprINR + decoder)
     jcfg = config.joint
     jcfg.n_output = hvg_ref.shape[1]      # HVG count for decoder output
     models = build_joint_models(jcfg, device=device)
@@ -171,8 +173,7 @@ def align_pair(
     result = train(
         model, matcher, x_ref, emb_ref, x2, emb_src,
         config.train, jcfg,
-        inr1=models["inr1"],
-        inr2=models["inr2"],
+        expr_inr=models["expr_inr"],
         decoder=models["decoder"],
         hvg1=hvg_ref,
         hvg2=hvg_src,
@@ -218,21 +219,11 @@ def run(config: Optional[PipelineConfig] = None) -> Tuple[List[ad.AnnData], pd.D
     print("Preprocessing...")
     slices = preprocess_slices(slices_raw, config.n_top_genes, config.pca_key)
 
-    # Global normalization
-    all_coords = [s.obsm[config.spatial_key] for s in slices]
-    _, mean, std = normalize_coordinates(all_coords)
-
-    # Grid detection on reference
-    coords_ref_norm = (slices[0].obsm[config.spatial_key] - mean) / std
-    sx, sy, is_grid, origin = detect_grid_spacing(coords_ref_norm)
-    grid_info = {"spacing_x": sx, "spacing_y": sy, "is_grid": is_grid, "origin": origin}
-    print(f"Grid mode: {is_grid}")
-
     # First slice = reference
     aligned_slices = [slices[0].copy()]
     aligned_slices[0].obsm["spatial_aligned"] = slices[0].obsm[config.spatial_key].copy()
 
-    # Pairwise alignment
+    # Pairwise alignment (each pair normalizes independently)
     print(f"\n{'=' * 60}")
     print(f"Aligning {len(slices)} slices to {slice_names[0]} (reference)")
     print(f"{'=' * 60}")
@@ -243,7 +234,7 @@ def run(config: Optional[PipelineConfig] = None) -> Tuple[List[ad.AnnData], pd.D
         print(f"{'=' * 50}")
 
         coords_aligned, _ = align_pair(
-            slices[0], slices[i], mean, std, grid_info, config, device,
+            slices[0], slices[i], config, device,
         )
 
         aligned = slices[i].copy()
@@ -383,31 +374,18 @@ def train_dataset(dataset: str, config: PipelineConfig, device: str) -> None:
         slices = load_slices(dataset, config.data_dir, slice_names)
         slices = preprocess_slices(slices, config.n_top_genes, config.pca_key)
 
-    # Global normalization
-    all_coords = [s.obsm[config.spatial_key] for s in slices]
-    _, mean, std = normalize_coordinates(all_coords)
-
-    # Grid detection on reference
-    coords_ref_norm = (slices[0].obsm[config.spatial_key] - mean) / std
-    sx, sy, is_grid, origin = detect_grid_spacing(coords_ref_norm)
-    grid_info = {"spacing_x": sx, "spacing_y": sy, "is_grid": is_grid, "origin": origin}
-    if is_grid:
-        print(f"  Grid detected: spacing=({sx:.4f}, {sy:.4f})")
-    else:
-        print(f"  Non-grid data: continuous coordinates")
-
     # Reference slice (no alignment needed)
     aligned_slices = [slices[0].copy()]
     aligned_slices[0].obsm["spatial_aligned"] = slices[0].obsm[config.spatial_key].copy()
 
-    # Pairwise alignment
+    # Pairwise alignment (each pair normalizes independently)
     for i in range(1, len(slices)):
         print(f"\n{'=' * 50}")
         print(f"  Aligning {slice_names[i]} -> {slice_names[0]}")
         print(f"{'=' * 50}")
 
         coords_aligned, result = align_pair(
-            slices[0], slices[i], mean, std, grid_info, config, device,
+            slices[0], slices[i], config, device,
         )
 
         aligned = slices[i].copy()
