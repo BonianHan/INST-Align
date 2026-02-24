@@ -242,20 +242,20 @@ Table~\ref{tab:alignment} presents spatial alignment results across all nine dat
 \centering
 \caption{Embedding quality (ARI / NMI) via mclust clustering. Average of two slices per pair. Best in \textbf{bold}, second-best \underline{underlined}. INR: our learned expression field embedding. ``--'': not yet available.}
 \label{tab:embedding}
-\setlength{\tabcolsep}{3.5pt}
+\setlength{\tabcolsep}{2.5pt}
 {\fontsize{8}{9.5}\selectfont
-\begin{tabular}{@{}l cc cc cc cc@{}}
+\begin{tabular}{@{}l cc cc cc cc cc@{}}
 \toprule
-& \multicolumn{2}{c}{DLPFC Samp.~1} & \multicolumn{2}{c}{DLPFC Samp.~2} & \multicolumn{2}{c}{DLPFC Samp.~3} & \multicolumn{2}{c}{MouseEmbryo} \\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
-Method & ARI & NMI & ARI & NMI & ARI & NMI & ARI & NMI \\
+& \multicolumn{2}{c}{DLPFC Samp.~1} & \multicolumn{2}{c}{DLPFC Samp.~2} & \multicolumn{2}{c}{DLPFC Samp.~3} & \multicolumn{2}{c}{MouseEmbryo} & \multicolumn{2}{c}{Mean} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}
+Method & ARI & NMI & ARI & NMI & ARI & NMI & ARI & NMI & ARI & NMI \\
 \midrule
-PCA        & .298 & .385 & .205 & .364 & .208 & .340 & .128 & .215 \\
-Seurat     & .237 & .372 & .285 & .287 & .253 & .397 & .078 & .220 \\
-STAligner  & .273 & .474 & \underline{.463} & \underline{.556} & .293 & \underline{.491} & \textbf{.356} & \textbf{.552} \\
-GraphST    & \underline{.431} & \underline{.641} & \textbf{.490} & \textbf{.589} & \textbf{.618} & \textbf{.724} & .266 & \underline{.516} \\
-SPIRAL     & \textbf{.558} & \textbf{.652} & .359 & .484 & \underline{.356} & .478 & .192 & .355 \\
-INR (Ours) & .397 & .490 & \underline{.463} & .446 & .246 & .393 & \underline{.341} & .512 \\
+PCA        & .298 & .385 & .205 & .364 & .208 & .340 & .128 & .215 & .210 & .326 \\
+Seurat     & .237 & .372 & .285 & .287 & .253 & .397 & .078 & .220 & .213 & .319 \\
+STAligner  & .273 & .474 & \underline{.463} & \underline{.556} & .293 & \underline{.491} & \textbf{.356} & \textbf{.552} & \underline{.346} & \underline{.518} \\
+GraphST    & \underline{.431} & \underline{.641} & \textbf{.490} & \textbf{.589} & \textbf{.618} & \textbf{.724} & .266 & \underline{.516} & \textbf{.451} & \textbf{.618} \\
+SPIRAL     & \textbf{.558} & \textbf{.652} & .359 & .484 & \underline{.356} & .478 & .192 & .355 & .366 & .492 \\
+INR (Ours) & .397 & .490 & \underline{.463} & .446 & .246 & .393 & \underline{.341} & .512 & .362 & .460 \\
 \bottomrule
 \end{tabular}
 }
