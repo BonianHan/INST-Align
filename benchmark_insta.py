@@ -742,7 +742,10 @@ def run_spiral_embedding(slices_raw, label_key="original_domain",
 
 def evaluate_embeddings_dlpfc(slices, slices_raw, sample_ids,
                               inr_models_for_group=None,
-                              norm_params_for_group=None, pca_key="X_pca",
+                              norm_params_for_group=None,
+                              deform_models_for_group=None,
+                              rigid_coords_for_group=None,
+                              pca_key="X_pca",
                               label_key="original_domain", device="cpu",
                               run_stagate=True, run_staligner=True,
                               run_graphst=True,
@@ -756,6 +759,8 @@ def evaluate_embeddings_dlpfc(slices, slices_raw, sample_ids,
         slices_raw: list of raw AnnData (original counts, for integration methods).
         inr_models_for_group: list of trained ExprINR models (one per pair).
         norm_params_for_group: list of (mean, std) tuples, one per pair.
+        deform_models_for_group: list of trained DeformationNet models (one per pair).
+        rigid_coords_for_group: list of coords2_rigid in normalized space (one per pair).
         clustering_methods: tuple of clustering methods to evaluate.
     """
     rows = []
@@ -781,38 +786,81 @@ def evaluate_embeddings_dlpfc(slices, slices_raw, sample_ids,
             print(f"      Slice {sample_ids[i]} [{clust_method}]: ARI={ari:.4f}  NMI={nmi:.4f}")
 
     # INR embeddings (from trained ExprINR)
+    # For pair i: INR was trained on slice i (reference).
+    #   - Slice i (ref): normalize coords → INR → embedding
+    #   - Slice i+1 (source): normalize coords → rigid → DeformNet → INR → embedding
     if inr_models_for_group and norm_params_for_group:
         print("    Running INR embedding eval...")
+        inr_evaluated = set()  # track which slices already evaluated
         for clust_method in clustering_methods:
             for i in range(len(inr_models_for_group)):
-                s = slices[i]
                 inr_model = inr_models_for_group[i]
                 np_entry = norm_params_for_group[i]
-                if inr_model is not None and np_entry is not None:
-                    mean, std = np_entry
-                    raw_coords = s.obsm["spatial"]
-                    coords_norm = (raw_coords - mean) / std
-                    inr_model.eval()
-                    with torch.no_grad():
-                        coords_t = torch.tensor(coords_norm.astype(np.float32), device=device)
-                        alpha = torch.tensor(float(inr_model.n_freqs), device=device)
-                        inr_emb = inr_model(coords_t, alpha).cpu().numpy()
-                    labels = np.asarray(s.obs[label_key])
-                    coords = s.obsm["spatial"]
-                    refine_r = None
-                    if clust_method == "mclust":
-                        from sklearn.neighbors import NearestNeighbors
-                        _nn = NearestNeighbors(n_neighbors=2).fit(coords)
-                        _d, _ = _nn.kneighbors(coords)
-                        refine_r = float(np.median(_d[:, 1])) * 3.0
-                    ari, nmi = compute_ari_nmi(inr_emb, labels, n_clusters,
-                                               method=clust_method,
-                                               spatial_coords=coords,
-                                               refine_radius=refine_r)
-                    suffix = f"_{clust_method}" if clust_method != "mclust" else ""
+                if inr_model is None or np_entry is None:
+                    continue
+                mean, std = np_entry
+                inr_model.eval()
+
+                # --- Slice i (reference): direct coords → INR ---
+                s_ref = slices[i]
+                raw_coords_ref = s_ref.obsm["spatial"]
+                coords_norm_ref = (raw_coords_ref - mean) / std
+                with torch.no_grad():
+                    coords_t = torch.tensor(coords_norm_ref.astype(np.float32), device=device)
+                    alpha = torch.tensor(float(inr_model.n_freqs), device=device)
+                    inr_emb_ref = inr_model(coords_t, alpha).cpu().numpy()
+                labels_ref = np.asarray(s_ref.obs[label_key])
+                coords_ref = s_ref.obsm["spatial"]
+                refine_r = None
+                if clust_method == "mclust":
+                    from sklearn.neighbors import NearestNeighbors
+                    _nn = NearestNeighbors(n_neighbors=2).fit(coords_ref)
+                    _d, _ = _nn.kneighbors(coords_ref)
+                    refine_r = float(np.median(_d[:, 1])) * 3.0
+                ari, nmi = compute_ari_nmi(inr_emb_ref, labels_ref, n_clusters,
+                                           method=clust_method,
+                                           spatial_coords=coords_ref,
+                                           refine_radius=refine_r)
+                suffix = f"_{clust_method}" if clust_method != "mclust" else ""
+                if (i, clust_method) not in inr_evaluated:
                     rows.append({"Slice": sample_ids[i], "Embedding": f"INR{suffix}",
                                  "ARI": ari, "NMI": nmi})
                     print(f"      Slice {sample_ids[i]} [{clust_method}]: ARI={ari:.4f}  NMI={nmi:.4f}")
+                    inr_evaluated.add((i, clust_method))
+
+                # --- Slice i+1 (source): rigid coords → DeformNet → INR ---
+                src_idx = i + 1
+                if src_idx < len(slices):
+                    deform_model = (deform_models_for_group[i]
+                                    if deform_models_for_group else None)
+                    c2_rigid = (rigid_coords_for_group[i]
+                                if rigid_coords_for_group else None)
+                    if deform_model is not None and c2_rigid is not None:
+                        deform_model.eval()
+                        s_src = slices[src_idx]
+                        with torch.no_grad():
+                            x2_rigid_t = torch.tensor(c2_rigid.astype(np.float32), device=device)
+                            alpha_def = torch.tensor(float(deform_model.n_freqs), device=device)
+                            x2_def = deform_model(x2_rigid_t, alpha_def)
+                            alpha_inr = torch.tensor(float(inr_model.n_freqs), device=device)
+                            inr_emb_src = inr_model(x2_def, alpha_inr).cpu().numpy()
+                        labels_src = np.asarray(s_src.obs[label_key])
+                        coords_src = s_src.obsm["spatial"]
+                        refine_r = None
+                        if clust_method == "mclust":
+                            from sklearn.neighbors import NearestNeighbors
+                            _nn = NearestNeighbors(n_neighbors=2).fit(coords_src)
+                            _d, _ = _nn.kneighbors(coords_src)
+                            refine_r = float(np.median(_d[:, 1])) * 3.0
+                        ari, nmi = compute_ari_nmi(inr_emb_src, labels_src, n_clusters,
+                                                   method=clust_method,
+                                                   spatial_coords=coords_src,
+                                                   refine_radius=refine_r)
+                        if (src_idx, clust_method) not in inr_evaluated:
+                            rows.append({"Slice": sample_ids[src_idx], "Embedding": f"INR{suffix}",
+                                         "ARI": ari, "NMI": nmi})
+                            print(f"      Slice {sample_ids[src_idx]} [{clust_method}]: ARI={ari:.4f}  NMI={nmi:.4f}")
+                            inr_evaluated.add((src_idx, clust_method))
 
     # ---- STAGATE embeddings (per-slice, no cross-slice alignment) ----
     if run_stagate:
@@ -1086,6 +1134,8 @@ def save_embedding_results(df_emb_all, spot_counts, slice_ids,
 def main():
     parser = argparse.ArgumentParser(description="Benchmark INSTA on DLPFC")
     parser.add_argument("--no_paste", action="store_true", default=True)
+    parser.add_argument("--no_paste2", action="store_true", default=False)
+    parser.add_argument("--no_gpsa", action="store_true", default=False)
     parser.add_argument("--no_spateo", action="store_true", default=False)
     parser.add_argument("--no_stalign", action="store_true", default=True)
     parser.add_argument("--no_stagate", action="store_true", help="Skip STAGATE embedding")
@@ -1119,12 +1169,21 @@ def main():
     # DLPFC-specific: lam_jacobian=0.3 (0.1 too weak → collapse; 1.0 too strong)
     config.joint.lam_jacobian = 0.3
 
+    # Parse dlpfc_pairs: selects which slices per group for BOTH Part 1 and Part 2
+    # e.g. ["0,1", "0,1", "0,1"] → [[0,1], [0,1], [0,1]]
+    # IMPORTANT: use consecutive indices (e.g. 0,1 or 1,2) for meaningful alignment
+    dlpfc_pairs = None
+    if args.dlpfc_pairs:
+        dlpfc_pairs = [[int(x) for x in p.split(",")] for p in args.dlpfc_pairs]
+
     # ================================================================
     # Part 1: Alignment Benchmark
     # ================================================================
     sample_indices = args.sample_groups
     inr_models = {}
     norm_params = {}
+    deform_models = {}
+    rigid_coords_norm = {}
 
     if not args.skip_alignment:
         print("\n" + "#" * 70)
@@ -1134,8 +1193,13 @@ def main():
         layer_groups = []
         sample_id_groups = []
         dataset_folders = []
-        for idx in sample_indices:
-            group = DLPFC_SAMPLE_GROUPS[idx]
+        for gi, idx in enumerate(sample_indices):
+            group_full = DLPFC_SAMPLE_GROUPS[idx]
+            if dlpfc_pairs and gi < len(dlpfc_pairs):
+                sel = dlpfc_pairs[gi]
+                group = [group_full[i] for i in sel]
+            else:
+                group = list(group_full)
             slices = []
             folder = f"DLPFC_sample{idx + 1}"
             for sample_id in group:
@@ -1147,10 +1211,12 @@ def main():
             sample_id_groups.append(group)
             dataset_folders.append(folder)
 
-        df_align, inr_models, norm_params = benchmark_all(
+        df_align, inr_models, norm_params, deform_models, rigid_coords_norm = benchmark_all(
             layer_groups, config, device=device,
             label_key="original_domain", label_map=DLPFC_LABEL_MAP,
             run_paste=not args.no_paste,
+            run_paste2=not args.no_paste2,
+            run_gpsa=not args.no_gpsa,
             run_spateo=not args.no_spateo,
             run_stalign=not args.no_stalign,
             sample_id_groups=sample_id_groups,
@@ -1184,10 +1250,7 @@ def main():
     spot_counts = {}   # {dataset_name: [n_obs_per_slice]}
     slice_ids = {}     # {dataset_name: [slice_id, ...]}
 
-    # Parse dlpfc_pairs: e.g. ["0,2", "0,1", "0,2"] → [[0,2], [0,1], [0,2]]
-    dlpfc_pairs = None
-    if args.dlpfc_pairs:
-        dlpfc_pairs = [[int(x) for x in p.split(",")] for p in args.dlpfc_pairs]
+    # dlpfc_pairs already parsed above (before Part 1)
 
     if args.no_dlpfc:
         sample_indices = []
@@ -1227,18 +1290,23 @@ def main():
             slices.append(a)
         st.align.group_pca(slices, pca_key="X_pca")
 
-        # Collect trained INR models and their normalization params
+        # Collect trained INR models, deform models, and normalization params
         inr_list = []
         norm_list = []
+        deform_list = []
+        rigid_coords_list = []
         for pi in range(len(group) - 1):
-            inr_m = inr_models.get((gi, pi), None)
-            inr_list.append(inr_m)
+            inr_list.append(inr_models.get((gi, pi), None))
             norm_list.append(norm_params.get((gi, pi), None))
+            deform_list.append(deform_models.get((gi, pi), None))
+            rigid_coords_list.append(rigid_coords_norm.get((gi, pi), None))
 
         df_emb = evaluate_embeddings_dlpfc(
             slices, slices_raw, group,
             inr_models_for_group=inr_list,
             norm_params_for_group=norm_list,
+            deform_models_for_group=deform_list,
+            rigid_coords_for_group=rigid_coords_list,
             device=device,
             run_stagate=not args.no_stagate,
             run_staligner=not args.no_staligner,
@@ -1300,25 +1368,36 @@ def main():
         # Train INR on MouseEmbryo pair (phase 1 + phase 2)
         embryo_inr_list = [None]
         embryo_norm_list = [None]
+        embryo_deform_list = [None]
+        embryo_rigid_coords_list = [None]
         if not args.no_inr:
             print("  Training INR on MouseEmbryo...")
+            # Use adaptive ICP for embryo (may have rotation)
+            saved_icp_mode = config.icp.mode
+            config.icp.mode = "adaptive"
             try:
-                _, _, _t_inr, embryo_expr_inr, embryo_norm_ms = run_ours(
+                _, _, _t_inr, embryo_expr_inr, embryo_norm_ms, embryo_deform, embryo_rigid_coords = run_ours(
                     embryo_raw[0].copy(), embryo_raw[1].copy(),
                     config, device=device,
                     label_key=embryo_label_key,
                 )
                 embryo_inr_list = [embryo_expr_inr]
                 embryo_norm_list = [embryo_norm_ms]
+                embryo_deform_list = [embryo_deform]
+                embryo_rigid_coords_list = [embryo_rigid_coords]
                 print(f"  INR training done ({_t_inr:.1f}s)")
             except Exception as e:
                 print(f"  INR training failed: {e}")
                 import traceback; traceback.print_exc()
+            finally:
+                config.icp.mode = saved_icp_mode  # restore for other datasets
 
         df_emb_embryo = evaluate_embeddings_dlpfc(
             embryo_slices, embryo_raw, sample_ids_embryo,
             inr_models_for_group=embryo_inr_list,
             norm_params_for_group=embryo_norm_list,
+            deform_models_for_group=embryo_deform_list,
+            rigid_coords_for_group=embryo_rigid_coords_list,
             label_key=embryo_label_key,
             device=device,
             run_stagate=not args.no_stagate,

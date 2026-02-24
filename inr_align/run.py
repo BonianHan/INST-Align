@@ -165,7 +165,7 @@ def align_pair(
     model = DeformationNet(config.model).to(device)
     matcher = UnifiedCostMatcher(config.matcher)
 
-    # Joint components (single ExprINR + decoder)
+    # Joint components (dual ExprINR + shared decoder)
     jcfg = config.joint
     jcfg.n_output = hvg_ref.shape[1]      # HVG count for decoder output
     models = build_joint_models(jcfg, device=device)
@@ -173,7 +173,8 @@ def align_pair(
     result = train(
         model, matcher, x_ref, emb_ref, x2, emb_src,
         config.train, jcfg,
-        expr_inr=models["expr_inr"],
+        expr_inr_s1=models["expr_inr_s1"],
+        expr_inr_s2=models["expr_inr_s2"],
         decoder=models["decoder"],
         hvg1=hvg_ref,
         hvg2=hvg_src,

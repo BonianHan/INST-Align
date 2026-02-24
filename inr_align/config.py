@@ -67,16 +67,16 @@ class MatcherConfig:
 class TrainConfig:
     """Training loop hyper-parameters."""
 
-    epochs: int = 200
+    epochs: int = 400
     batch_size: int = 2500
     topk: int = 64
     lr: float = 1e-3
     weight_rev: float = 1.0
     full_reverse_interval: int = 1   # Full-coverage reverse loss every N epochs (0 = off)
     grad_clip: float = 1.0
-    warmup_fraction: float = 0.3
+    warmup_fraction: float = 0.2
     print_every: int = 50
-    scheduler_patience: int = 50     # ReduceLROnPlateau: epochs without improvement before LR drop
+    scheduler_patience: int = 80     # ReduceLROnPlateau: epochs without improvement before LR drop
     scheduler_factor: float = 0.5    # LR multiplied by this factor on plateau
     scheduler_min_lr: float = 1e-6   # minimum LR floor
 
@@ -90,17 +90,19 @@ class JointConfig:
     """Hyperparameters for ExprINR / Decoder.
 
     Phase 1 — INR Pretrain (``inr_pretrain_epochs``):
-        A single ExprINR learns the spatial expression field on slice 1:
-        coords1 → ExprINR → emb → Decoder(emb) → expr1_hat
+        Two independent ExprINRs each learn their own slice's expression field,
+        sharing a single Decoder to force embedding-space alignment:
+        coords1 → ExprINR_s1 → emb → SharedDecoder(emb) → expr1_hat
+        coords2 → ExprINR_s2 → emb → SharedDecoder(emb) → expr2_hat
 
     Phase 2 — Joint Alignment (``TrainConfig.epochs``):
-        Same ExprINR used for both slices (coords in same space).
+        ExprINR_s1 for reference, ExprINR_s2 for deformed source.
         DeformNet learns deformation via matching loss.
-        ExprINR + decoder continue learning via recon loss.
-        P-matrix uses ExprINR embeddings (detached) as soft biological prior.
+        INRs + decoder continue learning via recon loss.
+        P-matrix uses INR embeddings (detached) as soft biological prior.
     """
 
-    # --- ExprINR (coords -> embedding) ---
+    # --- ExprINR (coords -> embedding, one per slice) ---
     emb_dim: int = 64               # Bottleneck embedding dimension
     inr_hidden: int = 256           # INR backbone hidden width
     inr_layers: int = 4             # INR backbone layers
@@ -108,7 +110,7 @@ class JointConfig:
     inr_max_freq_log2: int = 5      # Max frequency (log2) for PE
 
     # --- INR pretraining ---
-    inr_pretrain_epochs: int = 300  # Phase 1 pretrain epochs (s1 only)
+    inr_pretrain_epochs: int = 2000  # Phase 1 pretrain epochs (s1 only)
     inr_pretrain_lr: float = 1e-3   # Learning rate for INR pretraining
     freeze_inr_phase2: bool = False  # ExprINR+decoder continue learning in Phase 2
 

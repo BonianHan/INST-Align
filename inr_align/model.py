@@ -2,19 +2,20 @@
 
 Architecture::
 
-    Phase 1 (INR Pretrain):
-        coords1 -> ExprINR -> emb -> Decoder(emb) -> expr1_hat
+    Phase 1 (INR Pretrain — dual INR, shared decoder):
+        coords1 -> ExprINR_s1 -> emb -> SharedDecoder(emb) -> expr1_hat
+        coords2 -> ExprINR_s2 -> emb -> SharedDecoder(emb) -> expr2_hat
 
     Phase 2 (Joint Alignment):
         coords2 -> DeformNet -> coords2_def
-        ExprINR(coords1)     -> emb -> P-matrix + Decoder(emb) -> expr1_hat
-        ExprINR(coords2_def) -> emb -> P-matrix + Decoder(emb) -> expr2_hat
+        ExprINR_s1(coords1)     -> emb -> P-matrix + Decoder(emb) -> expr1_hat
+        ExprINR_s2(coords2_def) -> emb -> P-matrix + Decoder(emb) -> expr2_hat
 
 Components:
 - ``WindowedPositionalEncoding``: windowed Fourier positional encoding.
 - ``DeformationNet``: spatial-only deformation network.
-- ``ExprINR``: coords -> PE -> MLP -> embedding (single INR for both slices).
-- ``ExprDecoder``: embedding -> reconstructed expression (no batch info).
+- ``ExprINR``: coords -> PE -> MLP -> embedding (one per slice).
+- ``ExprDecoder``: embedding -> reconstructed expression (shared across slices).
 - ``UnifiedCostMatcher``: adaptive-temperature soft-assignment matcher.
 - ``adaptive_icp``: PCA-guided + full-search ICP for arbitrary rotations.
 """
@@ -174,12 +175,12 @@ class ExprINR(nn.Module):
 
         (x, y) -> WindowedPE -> MLP(LayerNorm+ReLU) -> bottleneck(emb_dim)
 
-    A single ExprINR is used for both slices.  Pretrained on slice 1 only
-    (Phase 1), then used for both slices in Phase 2 after rigid alignment
-    brings coordinates into the same space.
+    One ExprINR is created per slice.  Both share a single ExprDecoder,
+    which forces their embedding spaces to align (the shared decoder must
+    decode embeddings from either INR into the same gene-expression space).
 
-    The bottleneck embedding is fed to an :class:`ExprDecoder` for gene
-    expression reconstruction, supervised by SUICA-style loss.
+    The bottleneck embedding is fed to the shared :class:`ExprDecoder` for
+    gene expression reconstruction, supervised by SUICA-style loss.
     """
 
     def __init__(
@@ -213,7 +214,7 @@ class ExprINR(nn.Module):
 
 
 # ============================================================================
-# Expression Decoder (embedding + slice_id -> expression)
+# Expression Decoder (embedding -> expression)
 # ============================================================================
 
 
@@ -267,31 +268,40 @@ def build_joint_models(
     config: JointConfig,
     device: str = "cuda",
 ) -> Dict[str, nn.Module]:
-    """Build a single ExprINR + decoder from config.
+    """Build two ExprINRs (one per slice) + shared decoder from config.
 
-    One ExprINR maps spatial coordinates to embeddings for both slices.
-    An ExprDecoder reconstructs gene expression from embeddings without
-    any batch/slice information (STINR-style).
+    Each ExprINR independently maps spatial coordinates to embeddings.
+    A single shared ExprDecoder reconstructs gene expression from
+    embeddings of *either* INR, forcing the embedding spaces to align.
 
     Args:
         config: Joint config with INR/decoder architecture params.
         device: Target device.
 
     Returns:
-        Dict with keys ``"expr_inr"``, ``"decoder"``.
+        Dict with keys ``"expr_inr_s1"``, ``"expr_inr_s2"``, ``"decoder"``.
+        Also includes ``"expr_inr"`` aliased to ``"expr_inr_s1"`` for
+        backward compatibility with code that expects a single INR.
     """
-    expr_inr = ExprINR(
+    inr_kwargs = dict(
         d_in=2, emb_dim=config.emb_dim,
         hidden=config.inr_hidden, n_layers=config.inr_layers,
         n_freqs=config.inr_n_freqs, max_freq_log2=config.inr_max_freq_log2,
-    ).to(device)
+    )
+    expr_inr_s1 = ExprINR(**inr_kwargs).to(device)
+    expr_inr_s2 = ExprINR(**inr_kwargs).to(device)
 
     dec = ExprDecoder(
         emb_dim=config.emb_dim, n_output=config.n_output,
         hidden=config.decoder_hidden, n_layers=config.decoder_layers,
     ).to(device)
 
-    return {"expr_inr": expr_inr, "decoder": dec}
+    return {
+        "expr_inr_s1": expr_inr_s1,
+        "expr_inr_s2": expr_inr_s2,
+        "expr_inr": expr_inr_s1,  # backward compat alias
+        "decoder": dec,
+    }
 
 
 # ============================================================================

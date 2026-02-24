@@ -368,10 +368,10 @@ def run_ours(
     device: str = "cuda",
     label_key: str = "original_domain",
 ) -> Tuple[np.ndarray, np.ndarray, float, Optional["ExprINR"]]:
-    """Our method: adaptive ICP + two-phase DeformNet with single ExprINR.
+    """Our method: adaptive ICP + two-phase DeformNet with dual ExprINR.
 
     Returns:
-        ``(coords2_rigid_denorm, coords2_final, elapsed_time, expr_inr)``.
+        ``(coords2_rigid_denorm, coords2_final, elapsed_time, expr_inr_s1)``.
     """
     # Preprocessing
     for ad_ in [slice1, slice2]:
@@ -426,7 +426,7 @@ def run_ours(
     model = DeformationNet(config.model).to(device)
     matcher = UnifiedCostMatcher(config.matcher)
 
-    # Joint components (single ExprINR + decoder)
+    # Joint components (dual ExprINR + shared decoder)
     jcfg = config.joint
     jcfg.n_output = hvg1.shape[1]      # HVG count for decoder output
     models = build_joint_models(jcfg, device=device)
@@ -434,7 +434,8 @@ def run_ours(
     result = train(
         model, matcher, x1, emb1, x2, emb2,
         config.train, jcfg,
-        expr_inr=models["expr_inr"],
+        expr_inr_s1=models["expr_inr_s1"],
+        expr_inr_s2=models["expr_inr_s2"],
         decoder=models["decoder"],
         hvg1=hvg1,
         hvg2=hvg2,
@@ -458,7 +459,7 @@ def run_ours(
     print(f"  [COORD DEBUG] c2_final_de:  x=[{coords2_final[:,0].min():.1f}, {coords2_final[:,0].max():.1f}]  y=[{coords2_final[:,1].min():.1f}, {coords2_final[:,1].max():.1f}]")
 
     elapsed = time.time() - start
-    return coords2_rigid_denorm, coords2_final, elapsed, result.expr_inr, (mean, std)
+    return coords2_rigid_denorm, coords2_final, elapsed, result.expr_inr, (mean, std), result.deform, coords2_rigid
 
 
 # ============================================================================
@@ -512,6 +513,8 @@ def benchmark_all(
     rows = []
     inr_models: Dict[Tuple[int, int], ExprINR] = {}
     norm_params: Dict[Tuple[int, int], Tuple] = {}  # (mean, std) per pair
+    deform_models: Dict[Tuple[int, int], DeformationNet] = {}
+    rigid_coords_norm: Dict[Tuple[int, int], np.ndarray] = {}  # coords2_rigid in norm space
 
     for j in range(len(layer_groups)):
         for i in range(len(layer_groups[j]) - 1):
@@ -645,7 +648,7 @@ def benchmark_all(
 
             # --- Ours (two-phase DeformNet + ExprINR) ---
             try:
-                c2_rigid_o, c2_final_o, t_o, expr_inr_o, norm_ms = run_ours(
+                c2_rigid_o, c2_final_o, t_o, expr_inr_o, norm_ms, deform_o, c2_rigid_norm_o = run_ours(
                     s1.copy(), s2.copy(), config, device, label_key,
                 )
                 rows.append(_make_row("INSTA-Rigid", t_o, c2_rigid_o))
@@ -653,12 +656,14 @@ def benchmark_all(
                 if expr_inr_o is not None:
                     inr_models[(j, i)] = expr_inr_o
                     norm_params[(j, i)] = norm_ms
+                    deform_models[(j, i)] = deform_o
+                    rigid_coords_norm[(j, i)] = c2_rigid_norm_o
             except Exception as e:
                 print(f"  Ours failed: {e}")
                 import traceback
                 traceback.print_exc()
 
-    return pd.DataFrame(rows), inr_models, norm_params
+    return pd.DataFrame(rows), inr_models, norm_params, deform_models, rigid_coords_norm
 
 
 # ============================================================================
