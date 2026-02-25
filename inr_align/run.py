@@ -220,25 +220,25 @@ def run(config: Optional[PipelineConfig] = None) -> Tuple[List[ad.AnnData], pd.D
     print("Preprocessing...")
     slices = preprocess_slices(slices_raw, config.n_top_genes, config.pca_key)
 
-    # First slice = reference
+    # First slice keeps original coordinates
     aligned_slices = [slices[0].copy()]
     aligned_slices[0].obsm["spatial_aligned"] = slices[0].obsm[config.spatial_key].copy()
 
-    # Pairwise alignment (each pair normalizes independently)
+    # Consecutive pairwise alignment (matches benchmark protocol)
     print(f"\n{'=' * 60}")
-    print(f"Aligning {len(slices)} slices to {slice_names[0]} (reference)")
+    print(f"Aligning {len(slices)} slices (consecutive pairs)")
     print(f"{'=' * 60}")
 
-    for i in range(1, len(slices)):
+    for i in range(len(slices) - 1):
         print(f"\n{'=' * 50}")
-        print(f"Aligning {slice_names[i]} \u2192 {slice_names[0]}")
+        print(f"Aligning {slice_names[i + 1]} \u2192 {slice_names[i]}")
         print(f"{'=' * 50}")
 
         coords_aligned, _ = align_pair(
-            slices[0], slices[i], config, device,
+            slices[i], slices[i + 1], config, device,
         )
 
-        aligned = slices[i].copy()
+        aligned = slices[i + 1].copy()
         aligned.obsm["spatial_aligned"] = coords_aligned
         aligned_slices.append(aligned)
 
@@ -375,21 +375,21 @@ def train_dataset(dataset: str, config: PipelineConfig, device: str) -> None:
         slices = load_slices(dataset, config.data_dir, slice_names)
         slices = preprocess_slices(slices, config.n_top_genes, config.pca_key)
 
-    # Reference slice (no alignment needed)
+    # First slice keeps original coordinates
     aligned_slices = [slices[0].copy()]
     aligned_slices[0].obsm["spatial_aligned"] = slices[0].obsm[config.spatial_key].copy()
 
-    # Pairwise alignment (each pair normalizes independently)
-    for i in range(1, len(slices)):
+    # Consecutive pairwise alignment (matches benchmark protocol)
+    for i in range(len(slices) - 1):
         print(f"\n{'=' * 50}")
-        print(f"  Aligning {slice_names[i]} -> {slice_names[0]}")
+        print(f"  Aligning {slice_names[i + 1]} -> {slice_names[i]}")
         print(f"{'=' * 50}")
 
         coords_aligned, result = align_pair(
-            slices[0], slices[i], config, device,
+            slices[i], slices[i + 1], config, device,
         )
 
-        aligned = slices[i].copy()
+        aligned = slices[i + 1].copy()
         aligned.obsm["spatial_aligned"] = coords_aligned
         aligned_slices.append(aligned)
 
