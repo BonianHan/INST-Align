@@ -14,6 +14,8 @@ benchmark_results.png
 benchmark_alignment.csv
 benchmark_alignment.png
 benchmark_embedding.csv
+benchmark_insta_refibe.csv
+benchmark_insta_refibe_summary.csv
 expr_comparison_results.csv
 expr_comparison_summary.csv
 Scube_outputs/
@@ -32,12 +34,21 @@ dist/
 build/
 .eggs/
 
-# Jupyter checkpoints
+# Jupyter notebooks
+*.ipynb
 .ipynb_checkpoints/
 
-# Notebooks (exploratory, not part of core package)
-*.ipynb
-!visual_nonrigid.ipynb
+# LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.bbl
+*.blg
+*.out
+
+# Paper directory
+paper/
 
 # OS files
 .DS_Store
@@ -58,6 +69,15 @@ nul
 # Dev log (local only)
 log.txt
 tuning_log.md
+
+# Ablation & auxiliary scripts (local only)
+run_ablation_*.py
+run_expr_comparison.py
+run_benchmark.sh
+run_seurat_embryo.*
+eval_ari.py
+test_phase1_ari.py
+extract_splane_emb.py
 
 # Backup (local only)
 backup_before_refactor/
