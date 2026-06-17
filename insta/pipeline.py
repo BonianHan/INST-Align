@@ -2,17 +2,17 @@
 
 Command-line usage::
 
-    python -m inr_align --dataset STARMap
-    python -m inr_align --dataset STARMap --epochs 300 --use_expr_inr
-    python -m inr_align --datasets STARMap DLPFC_sample1 BaristaSeq
+    python -m insta --dataset STARMap
+    python -m insta --dataset STARMap --epochs 300 --use_expr_inr
+    python -m insta --datasets STARMap DLPFC_sample1 BaristaSeq
 
 Library usage::
 
-    from inr_align.run import run, align_pair
+    from insta.pipeline import run, align_pair
     aligned, metrics = run(PipelineConfig(dataset="STARMap"))
 
 Output:
-    Per-slice h5ad files saved to ``inr_align/inr/result/{dataset}/``
+    Per-slice h5ad files saved to ``insta/inr/result/{dataset}/``
     Each file retains original spatial (X, Y) and adds inr_X, inr_Y in .obs
 """
 
@@ -30,14 +30,20 @@ import pandas as pd
 import scanpy as sc
 import torch
 
-from inr_align.config import SLICE_ORDER, DLPFC_SAMPLE_GROUPS, PipelineConfig
-from inr_align.metrics import compute_istbench_metrics, mapping_accuracy_paste, coords_to_pi
-from inr_align.model import (
+from insta.config import SLICE_ORDER, DLPFC_SAMPLE_GROUPS, PipelineConfig
+from insta.metrics import compute_istbench_metrics
+from insta.model import (
     DeformationNet, UnifiedCostMatcher, adaptive_icp,
     build_joint_models, build_knn_graph,
 )
-from inr_align.engine import TrainResult, apply_model, train
-from inr_align.utils import detect_grid_spacing, denormalize_coordinates, normalize_coordinates
+from insta.trainer import TrainResult, apply_model, train
+from insta.utils import (
+    coords_to_pi,
+    detect_grid_spacing,
+    denormalize_coordinates,
+    mapping_accuracy_paste,
+    normalize_coordinates,
+)
 
 
 # ============================================================================
@@ -220,25 +226,25 @@ def run(config: Optional[PipelineConfig] = None) -> Tuple[List[ad.AnnData], pd.D
     print("Preprocessing...")
     slices = preprocess_slices(slices_raw, config.n_top_genes, config.pca_key)
 
-    # First slice keeps original coordinates
+    # First slice = reference
     aligned_slices = [slices[0].copy()]
     aligned_slices[0].obsm["spatial_aligned"] = slices[0].obsm[config.spatial_key].copy()
 
-    # Consecutive pairwise alignment (matches benchmark protocol)
+    # Pairwise alignment (each pair normalizes independently)
     print(f"\n{'=' * 60}")
-    print(f"Aligning {len(slices)} slices (consecutive pairs)")
+    print(f"Aligning {len(slices)} slices to {slice_names[0]} (reference)")
     print(f"{'=' * 60}")
 
-    for i in range(len(slices) - 1):
+    for i in range(1, len(slices)):
         print(f"\n{'=' * 50}")
-        print(f"Aligning {slice_names[i + 1]} \u2192 {slice_names[i]}")
+        print(f"Aligning {slice_names[i]} \u2192 {slice_names[0]}")
         print(f"{'=' * 50}")
 
         coords_aligned, _ = align_pair(
-            slices[i], slices[i + 1], config, device,
+            slices[0], slices[i], config, device,
         )
 
-        aligned = slices[i + 1].copy()
+        aligned = slices[i].copy()
         aligned.obsm["spatial_aligned"] = coords_aligned
         aligned_slices.append(aligned)
 
@@ -293,12 +299,12 @@ def save_inr_results(
 ) -> str:
     """Save per-slice h5ad files with INR-aligned coordinates.
 
-    Output directory: ``inr_align/inr/result/{dataset}/``
+    Output directory: ``insta/inr/result/{dataset}/``
 
     Returns:
         Output directory path.
     """
-    result_dir = os.path.join("inr_align", "inr", "result", config.dataset)
+    result_dir = os.path.join("insta", "inr", "result", config.dataset)
     os.makedirs(result_dir, exist_ok=True)
 
     for i, (adata, name) in enumerate(zip(aligned_slices, slice_names)):
@@ -355,7 +361,7 @@ def train_dataset(dataset: str, config: PipelineConfig, device: str) -> None:
             slices.append(adata)
             print(f"  Loaded {sample_id}: {adata.shape}")
 
-        # Preprocess (same as benchmark run_ours)
+        # Preprocess with the same settings used by the experiment runners.
         for ad_ in slices:
             if "counts" not in ad_.layers:
                 ad_.layers["counts"] = ad_.X.copy()
@@ -375,21 +381,21 @@ def train_dataset(dataset: str, config: PipelineConfig, device: str) -> None:
         slices = load_slices(dataset, config.data_dir, slice_names)
         slices = preprocess_slices(slices, config.n_top_genes, config.pca_key)
 
-    # First slice keeps original coordinates
+    # Reference slice (no alignment needed)
     aligned_slices = [slices[0].copy()]
     aligned_slices[0].obsm["spatial_aligned"] = slices[0].obsm[config.spatial_key].copy()
 
-    # Consecutive pairwise alignment (matches benchmark protocol)
-    for i in range(len(slices) - 1):
+    # Pairwise alignment (each pair normalizes independently)
+    for i in range(1, len(slices)):
         print(f"\n{'=' * 50}")
-        print(f"  Aligning {slice_names[i + 1]} -> {slice_names[i]}")
+        print(f"  Aligning {slice_names[i]} -> {slice_names[0]}")
         print(f"{'=' * 50}")
 
         coords_aligned, result = align_pair(
-            slices[i], slices[i + 1], config, device,
+            slices[0], slices[i], config, device,
         )
 
-        aligned = slices[i + 1].copy()
+        aligned = slices[i].copy()
         aligned.obsm["spatial_aligned"] = coords_aligned
         aligned_slices.append(aligned)
 
@@ -410,10 +416,10 @@ ALL_DATASETS = list(SLICE_ORDER.keys())
 
 def main() -> None:
     """CLI entry point: align one or more datasets."""
-    from inr_align.config import add_pipeline_args, config_from_args, print_config
+    from insta.config import add_pipeline_args, config_from_args, print_config
 
     parser = argparse.ArgumentParser(
-        description="INR-Align: Spatial transcriptomics alignment",
+        description="INST-Align: Spatial transcriptomics alignment",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # Run-specific args

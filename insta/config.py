@@ -1,7 +1,7 @@
-"""Configuration dataclasses for inr_align.
+"""Configuration dataclasses for insta.
 
 All hyperparameters are centralized here. To tune, modify the config
-object before passing it to ``run()`` or ``benchmark_all()``.
+object before passing it to ``run()`` or the experiment runners.
 
 The CLI is auto-generated from the dataclass fields so that every config
 parameter can also be set from the command line.
@@ -53,7 +53,7 @@ class MatcherConfig:
     """Adaptive-temperature soft matcher."""
 
     tau_init: float = 0.1
-    tau_min: float = 0.05
+    tau_min: float = 0.01
     tau_max: float = 1.0
     lambda_feat: float = 1.0
     ema_decay: float = 0.9
@@ -68,15 +68,15 @@ class TrainConfig:
     """Training loop hyper-parameters."""
 
     epochs: int = 400
-    batch_size: int = 2500
+    batch_size: int = 4000
     topk: int = 64
     lr: float = 1e-3
     weight_rev: float = 1.0
     full_reverse_interval: int = 1   # Full-coverage reverse loss every N epochs (0 = off)
-    grad_clip: float = 1.0
+    grad_clip: float = 2.0
     warmup_fraction: float = 0.2
     print_every: int = 50
-    scheduler_patience: int = 80     # ReduceLROnPlateau: epochs without improvement before LR drop
+    scheduler_patience: int = 200    # ReduceLROnPlateau: epochs without improvement before LR drop
     scheduler_factor: float = 0.5    # LR multiplied by this factor on plateau
     scheduler_min_lr: float = 1e-6   # minimum LR floor
 
@@ -110,9 +110,10 @@ class JointConfig:
     inr_max_freq_log2: int = 5      # Max frequency (log2) for PE
 
     # --- INR pretraining ---
-    inr_pretrain_epochs: int = 2000  # Phase 1 pretrain epochs (s1 only)
+    inr_pretrain_epochs: int = 300   # Phase 1 pretrain epochs (dual INR + decoder)
     inr_pretrain_lr: float = 1e-3   # Learning rate for INR pretraining
     freeze_inr_phase2: bool = False  # ExprINR+decoder continue learning in Phase 2
+                                     # (matching loss gradient blocked by torch.no_grad)
 
     # --- Decoder (embedding -> expression, no batch info) ---
     n_output: int = 2000            # Reconstruction target dim (HVG count, set at runtime)
@@ -123,9 +124,8 @@ class JointConfig:
     lam_match: float = 1.0
     lam_recon: float = 1.0          # Recon weight during Phase 1 pretrain
     lam_recon_phase2: float = 0.1   # Reduced recon weight during Phase 2 alignment
-    lam_jacobian: float = 1.0
-    lam_uniqueness: float = 0.3     # Assignment uniqueness: prevent many-to-one collapse
-    lam_deform_mag: float = 0.1     # Deformation magnitude penalty
+    lam_jacobian: float = 0.01      # SVD-based Jacobian: penalizes singular value deviation from 1
+    lam_deform_mag: float = 0.05    # Deformation magnitude penalty
 
 
 # ============================================================================
@@ -160,7 +160,7 @@ class ICPConfig:
 
 @dataclass
 class PipelineConfig:
-    """Top-level configuration for run.py / benchmark.py."""
+    """Top-level configuration for pipeline and experiment scripts."""
 
     dataset: str = "STARMap"
     data_dir: str = "./Data"
@@ -309,12 +309,12 @@ def print_config(config: PipelineConfig) -> None:
 
 
 # ============================================================================
-# Known slice orderings for benchmark datasets
+# Known slice orderings for paper datasets
 # ============================================================================
 
 SLICE_ORDER: Dict[str, List[str]] = {
     "BaristaSeq": ["slices1", "slices2", "slices3"],
-    "STARMap": ["slices1", "slices3", "slices2"],
+    "STARMap": ["slices1", "slices3"],
     "DLPFC_sample1": ["slices2", "slices3", "slices1", "slices4"],
     "DLPFC_sample2": ["slices2", "slices3", "slices1", "slices4"],
     "DLPFC_sample3": ["slices2", "slices4", "slices1", "slices3"],
@@ -335,7 +335,7 @@ SLICE_ORDER: Dict[str, List[str]] = {
     "TNBC": ["slices1", "slices2"],
 }
 
-# DLPFC sample groups for benchmark (original_data format, per-pair)
+# DLPFC sample groups for spatial alignment evaluation
 DLPFC_SAMPLE_GROUPS: List[List[str]] = [
     ["151507", "151508", "151509", "151510"],
     ["151669", "151670", "151671", "151672"],

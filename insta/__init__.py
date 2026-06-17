@@ -1,16 +1,16 @@
-"""inr_align: Spatial transcriptomics alignment via implicit neural representations.
+"""insta: Spatial transcriptomics alignment via implicit neural representations.
 
 Quick start::
 
-    from inr_align import PipelineConfig, run
+    from insta import PipelineConfig, run
     aligned, metrics = run(PipelineConfig(dataset="STARMap"))
 
-Benchmark::
+Spatial alignment experiment::
 
-    from inr_align.benchmark import benchmark_all, print_summary
+    from insta.spatial_alignment import run_spatial_alignment_all, print_summary
 """
 
-from inr_align.config import (
+from insta.config import (
     DLPFC_SAMPLE_GROUPS,
     SLICE_ORDER,
     ICPConfig,
@@ -23,7 +23,7 @@ from inr_align.config import (
     config_from_args,
     print_config,
 )
-from inr_align.model import (
+from insta.model import (
     DeformationNet,
     ExprEncoder,
     ExprINR,
@@ -34,7 +34,7 @@ from inr_align.model import (
     build_joint_models,
     build_knn_graph,
 )
-from inr_align.loss import (
+from insta.loss import (
     compute_P_matrix,
     dice_loss,
     jacobian_reg,
@@ -42,29 +42,30 @@ from inr_align.loss import (
     recon_loss,
     recon_loss_from_emb,
 )
-from inr_align.engine import TrainResult, apply_model, apply_model_with_inr, train
-from inr_align.metrics import (
-    calculate_clc,
+from insta.trainer import TrainResult, apply_model, apply_model_with_inr, train
+from insta.metrics import (
     chamfer_distance,
     compute_istbench_metrics,
-    compute_lisi,
-    compute_silhouette,
-    coords_to_pi,
-    evaluate_alignment,
-    mapping_accuracy_nn,
+    mapping_accuracy_nn_bidi,
     mapping_accuracy_ot,
-    mapping_accuracy_paste,
-    sparse_P_to_dense_pi,
 )
-from inr_align.utils import (
+from insta.utils import (
+    coords_to_pi,
     denormalize_coordinates,
     detect_grid_spacing,
+    mapping_accuracy_paste,
     normalize_coordinates,
+    sparse_P_to_dense_pi,
 )
-from inr_align.run import (
+from insta.pipeline import (
     align_pair, run, save_inr_results, train_dataset,
 )
-from inr_align.benchmark import benchmark_all, benchmark_dataset, print_summary, plot_comparison
+from insta.spatial_alignment import (
+    plot_comparison,
+    print_summary,
+    run_spatial_alignment_all,
+    run_spatial_alignment_dataset,
+)
 
 __version__ = "0.4.0"
 
@@ -104,29 +105,25 @@ __all__ = [
     "apply_model_with_inr",
     "TrainResult",
     # Metrics
-    "mapping_accuracy_nn",
+    "mapping_accuracy_nn_bidi",
     "mapping_accuracy_ot",
-    "mapping_accuracy_paste",
-    "calculate_clc",
-    "evaluate_alignment",
-    "coords_to_pi",
-    "sparse_P_to_dense_pi",
     "compute_istbench_metrics",
-    "compute_lisi",
-    "compute_silhouette",
     "chamfer_distance",
     # Utils
     "normalize_coordinates",
     "denormalize_coordinates",
     "detect_grid_spacing",
+    "mapping_accuracy_paste",
+    "coords_to_pi",
+    "sparse_P_to_dense_pi",
     # Pipeline
     "run",
     "align_pair",
     "save_inr_results",
     "train_dataset",
-    # Benchmark
-    "benchmark_all",
-    "benchmark_dataset",
+    # Spatial alignment experiment
+    "run_spatial_alignment_all",
+    "run_spatial_alignment_dataset",
     "print_summary",
     "plot_comparison",
 ]

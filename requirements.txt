@@ -24,7 +24,22 @@ seaborn>=0.12
 # --- Utilities ---
 numba>=0.56
 
-# --- Baseline methods (for benchmark comparison) ---
+# --- Baseline methods for spatial alignment experiments ---
 paste-bio>=1.4                # PASTE alignment
 spateo-release>=0.0.1         # Spateo alignment
 # STalign: pip install git+https://github.com/JEFworks-Lab/STalign.git
+
+# --- Embedding baselines ---
+STAligner==1.0.0              # STAligner + STAGATE
+GraphST==1.1.1                # GraphST
+spiral==1.0                   # SPIRAL
+rpy2>=3.5                     # R interface (for mclust + Seurat)
+openpyxl>=3.1                 # Excel export
+torch-geometric>=2.0          # PyG (required by STAligner/GraphST)
+torch_scatter                 # PyG dependency
+torch_sparse                  # PyG dependency
+torch_cluster                 # PyG dependency
+
+# --- R packages (install inside R) ---
+# install.packages("mclust")    # mclust >= 6.0
+# install.packages("Seurat")    # Seurat >= 5.0

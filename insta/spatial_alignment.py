@@ -1,22 +1,18 @@
-"""Multi-method benchmark: PASTE / PASTE2 / GPSA / Spateo / STalign / Ours / No-align.
+"""Multi-method Experiment 1 runner: baselines / INST-Align / no-align.
 
-Compares all methods on the same dataset using seven metrics:
+Compares all methods on the same dataset using the paper's alignment metrics:
 
 1. **OT Accuracy** — PASTE-style transport-plan weighted label match.
 2. **NN Accuracy** — Bidirectional nearest-neighbour label match (iSTBench-style).
-3. **Ratio** — Many-to-one collapse measure (BenchmarkST).
-4. **CLC** — Contextual Label Consistency.
-5. **LISI** — Local Inverse Simpson's Index (domain consistency).
-6. **Silhouette** — Domain separation in aligned space.
-7. **Chamfer** — Symmetric Chamfer distance (geometric alignment).
+3. **Chamfer** — Symmetric Chamfer distance (geometric alignment).
 
 Run directly::
 
-    python -m inr_align.benchmark
+    python run_spatial_alignment.py
 
 Or import::
 
-    from inr_align.benchmark import benchmark_all, print_summary
+    from insta.spatial_alignment import run_spatial_alignment_all, print_summary
 """
 
 from __future__ import annotations
@@ -34,23 +30,20 @@ import seaborn as sns
 import spateo as st
 import torch
 
-from inr_align.config import DLPFC_SAMPLE_GROUPS, JointConfig, PipelineConfig
-from inr_align.metrics import (
-    calculate_clc,
-    chamfer_distance,
-    compute_lisi,
-    compute_silhouette,
-    coords_to_pi,
-    mapping_accuracy_nn_bidi,
-    mapping_accuracy_paste,
-    sparse_P_to_dense_pi,
-)
-from inr_align.model import (
+from insta.config import DLPFC_SAMPLE_GROUPS, JointConfig, PipelineConfig
+from insta.metrics import chamfer_distance, mapping_accuracy_nn_bidi
+from insta.model import (
     DeformationNet, UnifiedCostMatcher, adaptive_icp,
     build_joint_models, build_knn_graph, ExprINR,
 )
-from inr_align.engine import apply_model, train
-from inr_align.utils import detect_grid_spacing, normalize_coordinates
+from insta.trainer import apply_model, train
+from insta.utils import (
+    coords_to_pi,
+    detect_grid_spacing,
+    mapping_accuracy_paste,
+    normalize_coordinates,
+    sparse_P_to_dense_pi,
+)
 
 
 # ============================================================================
@@ -373,15 +366,22 @@ def run_ours(
     Returns:
         ``(coords2_rigid_denorm, coords2_final, elapsed_time, expr_inr_s1)``.
     """
-    # Preprocessing
-    for ad_ in [slice1, slice2]:
-        if "counts" not in ad_.layers:
-            ad_.layers["counts"] = ad_.X.copy()
-        sc.pp.normalize_total(ad_)
-        sc.pp.log1p(ad_)
-        if "highly_variable" not in ad_.var.columns:
-            sc.pp.highly_variable_genes(ad_, n_top_genes=config.n_top_genes)
-    st.align.group_pca([slice1, slice2], pca_key=config.pca_key)
+    # Preprocessing — skip if already done by a dataset runner.
+    already_preprocessed = all(
+        "counts" in ad_.layers and config.pca_key in ad_.obsm
+        for ad_ in [slice1, slice2]
+    )
+    if not already_preprocessed:
+        for ad_ in [slice1, slice2]:
+            if "counts" not in ad_.layers:
+                ad_.layers["counts"] = ad_.X.copy()
+            sc.pp.normalize_total(ad_)
+            sc.pp.log1p(ad_)
+            if "highly_variable" not in ad_.var.columns:
+                sc.pp.highly_variable_genes(ad_, n_top_genes=config.n_top_genes)
+        st.align.group_pca([slice1, slice2], pca_key=config.pca_key)
+    else:
+        print("  [run_ours] Data already preprocessed, skipping normalize/log1p/PCA")
 
     start = time.time()
 
@@ -447,27 +447,16 @@ def run_ours(
     coords2_final = x2_def.cpu().numpy() * std + mean
     coords2_rigid_denorm = coords2_rigid * std + mean
 
-    # --- Coordinate diagnostic ---
-    print(f"  [COORD DEBUG] raw coords1:  x=[{coords1[:,0].min():.1f}, {coords1[:,0].max():.1f}]  y=[{coords1[:,1].min():.1f}, {coords1[:,1].max():.1f}]")
-    print(f"  [COORD DEBUG] raw coords2:  x=[{coords2[:,0].min():.1f}, {coords2[:,0].max():.1f}]  y=[{coords2[:,1].min():.1f}, {coords2[:,1].max():.1f}]")
-    print(f"  [COORD DEBUG] norm mean={mean}, std={std}")
-    print(f"  [COORD DEBUG] c1_norm:      x=[{coords1_norm[:,0].min():.4f}, {coords1_norm[:,0].max():.4f}]  y=[{coords1_norm[:,1].min():.4f}, {coords1_norm[:,1].max():.4f}]")
-    print(f"  [COORD DEBUG] c2_rigid_n:   x=[{coords2_rigid[:,0].min():.4f}, {coords2_rigid[:,0].max():.4f}]  y=[{coords2_rigid[:,1].min():.4f}, {coords2_rigid[:,1].max():.4f}]")
-    x2_def_np = x2_def.cpu().numpy()
-    print(f"  [COORD DEBUG] c2_deform_n:  x=[{x2_def_np[:,0].min():.4f}, {x2_def_np[:,0].max():.4f}]  y=[{x2_def_np[:,1].min():.4f}, {x2_def_np[:,1].max():.4f}]")
-    print(f"  [COORD DEBUG] c2_rigid_de:  x=[{coords2_rigid_denorm[:,0].min():.1f}, {coords2_rigid_denorm[:,0].max():.1f}]  y=[{coords2_rigid_denorm[:,1].min():.1f}, {coords2_rigid_denorm[:,1].max():.1f}]")
-    print(f"  [COORD DEBUG] c2_final_de:  x=[{coords2_final[:,0].min():.1f}, {coords2_final[:,0].max():.1f}]  y=[{coords2_final[:,1].min():.1f}, {coords2_final[:,1].max():.1f}]")
-
     elapsed = time.time() - start
     return coords2_rigid_denorm, coords2_final, elapsed, result.expr_inr, (mean, std), result.deform, coords2_rigid
 
 
 # ============================================================================
-# Full benchmark
+# Full spatial alignment experiment
 # ============================================================================
 
 
-def benchmark_all(
+def run_spatial_alignment_all(
     layer_groups: List[List],
     config: Optional[PipelineConfig] = None,
     device: str = "cuda",
@@ -478,10 +467,11 @@ def benchmark_all(
     run_gpsa: bool = True,
     run_spateo: bool = True,
     run_stalign: bool = True,
+    run_insta: bool = True,
     sample_id_groups: Optional[List[List[str]]] = None,
     dataset_folders: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Run all methods on all sample groups.
+    """Run the spatial alignment experiment on all sample groups.
 
     Args:
         layer_groups: ``layer_groups[j][i]`` is an AnnData for sample
@@ -496,6 +486,7 @@ def benchmark_all(
         run_gpsa: Whether to include GPSA baseline.
         run_spateo: Whether to include Spateo baseline.
         run_stalign: Whether to include STalign baseline.
+        run_insta: Whether to include INST-Align.
         sample_id_groups: ``sample_id_groups[j][i]`` is the sample ID string
             for group *j*, slice *i*.  Used to load Splane embeddings.
         dataset_folders: ``dataset_folders[j]`` is the dataset folder name
@@ -503,8 +494,8 @@ def benchmark_all(
 
     Returns:
         ``(DataFrame, encoders_dict)`` where DataFrame has columns
-        ``[Sample, Pair, Method, Time, Accuracy, Accuracy_NN, Ratio,
-        CLC, LISI, Silhouette, Chamfer]`` and ``encoders_dict`` maps
+        ``[Sample, Pair, Method, Time, Accuracy, Accuracy_NN, Chamfer]``
+        and ``encoders_dict`` maps
         ``(sample_idx, pair_idx)`` to the trained ``ExprINR``.
     """
     if config is None:
@@ -539,7 +530,7 @@ def benchmark_all(
                       f"(s1: {(~_valid1).sum()}, s2: {(~_valid2).sum()})")
 
             def _make_row(method, t, c2_aligned, c1_ref=None):
-                """Compute all 7 metrics and build result row."""
+                """Compute Experiment 1 metrics and build result row."""
                 c1 = c1_ref if c1_ref is not None else _coords1
                 # Use filtered labels/coords for label-based metrics
                 c1_f = c1[_valid1]
@@ -550,21 +541,16 @@ def benchmark_all(
                 l2_s2 = s2.obs[label_key].iloc[np.where(_valid2)[0]]
                 pi = coords_to_pi(c1_f, c2_f)
                 acc_ot = mapping_accuracy_paste(l1_s1, l2_s2, pi, label_map)
-                acc_nn, ratio = mapping_accuracy_nn_bidi(l1_f, l2_f, c1_f, c2_f)
-                clc_val = calculate_clc(l1_f, l2_f, c1_f, c2_f)
-                lisi = compute_lisi(c1_f, c2_f, l1_f, l2_f)
-                sil = compute_silhouette(c1_f, c2_f, l1_f, l2_f)
+                acc_nn = mapping_accuracy_nn_bidi(l1_f, l2_f, c1_f, c2_f)
                 # Chamfer uses all points (geometric, no labels)
                 cham = chamfer_distance(c1, c2_aligned)
                 row = {
                     "Sample": j, "Pair": i, "Method": method, "Time": t,
                     "N1": s1.shape[0], "N2": s2.shape[0],
-                    "Accuracy": acc_ot, "Accuracy_NN": acc_nn, "Ratio": ratio,
-                    "CLC": clc_val, "LISI": lisi, "Silhouette": sil, "Chamfer": cham,
+                    "Accuracy": acc_ot, "Accuracy_NN": acc_nn, "Chamfer": cham,
                 }
                 print(f"  {method:16s} OT={acc_ot:.4f}  NN={acc_nn:.4f}  "
-                      f"Rat={ratio:.4f}  CLC={clc_val:.4f}  "
-                      f"LISI={lisi:.3f}  Sil={sil:.4f}  Cham={cham:.4f}")
+                      f"Cham={cham:.4f}")
                 return row
 
             # --- No-align ---
@@ -647,21 +633,22 @@ def benchmark_all(
                     print(f"  Spateo failed: {e}")
 
             # --- Ours (two-phase DeformNet + ExprINR) ---
-            try:
-                c2_rigid_o, c2_final_o, t_o, expr_inr_o, norm_ms, deform_o, c2_rigid_norm_o = run_ours(
-                    s1.copy(), s2.copy(), config, device, label_key,
-                )
-                rows.append(_make_row("INSTA-Rigid", t_o, c2_rigid_o))
-                rows.append(_make_row("INSTA-Nonrigid", t_o, c2_final_o))
-                if expr_inr_o is not None:
-                    inr_models[(j, i)] = expr_inr_o
-                    norm_params[(j, i)] = norm_ms
-                    deform_models[(j, i)] = deform_o
-                    rigid_coords_norm[(j, i)] = c2_rigid_norm_o
-            except Exception as e:
-                print(f"  Ours failed: {e}")
-                import traceback
-                traceback.print_exc()
+            if run_insta:
+                try:
+                    c2_rigid_o, c2_final_o, t_o, expr_inr_o, norm_ms, deform_o, c2_rigid_norm_o = run_ours(
+                        s1.copy(), s2.copy(), config, device, label_key,
+                    )
+                    rows.append(_make_row("INSTA-Rigid", t_o, c2_rigid_o))
+                    rows.append(_make_row("INSTA-Nonrigid", t_o, c2_final_o))
+                    if expr_inr_o is not None:
+                        inr_models[(j, i)] = expr_inr_o
+                        norm_params[(j, i)] = norm_ms
+                        deform_models[(j, i)] = deform_o
+                        rigid_coords_norm[(j, i)] = c2_rigid_norm_o
+                except Exception as e:
+                    print(f"  Ours failed: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     return pd.DataFrame(rows), inr_models, norm_params, deform_models, rigid_coords_norm
 
@@ -708,10 +695,6 @@ def print_summary(df: pd.DataFrame) -> None:
     metric_defs = [
         ("Accuracy", "OT Accuracy", "higher=better"),
         ("Accuracy_NN", "NN Accuracy", "higher=better"),
-        ("Ratio", "Ratio", "lower=better"),
-        ("CLC", "CLC", "higher=better"),
-        ("LISI", "LISI", "lower=better"),
-        ("Silhouette", "Silhouette", "higher=better"),
         ("Chamfer", "Chamfer", "lower=better"),
     ]
 
@@ -751,14 +734,6 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
         metrics.append("Accuracy"); titles.append("OT Acc \u2191")
     if "Accuracy_NN" in df.columns:
         metrics.append("Accuracy_NN"); titles.append("NN Acc \u2191")
-    if "CLC" in df.columns:
-        metrics.append("CLC"); titles.append("CLC \u2191")
-    if "Silhouette" in df.columns:
-        metrics.append("Silhouette"); titles.append("Silhouette \u2191")
-    if "Ratio" in df.columns:
-        metrics.append("Ratio"); titles.append("Ratio \u2193")
-    if "LISI" in df.columns:
-        metrics.append("LISI"); titles.append("LISI \u2193")
     if "Chamfer" in df.columns:
         metrics.append("Chamfer"); titles.append("Chamfer \u2193")
 
@@ -790,7 +765,7 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
     ax.set_xticks(x_base)
     ax.set_xticklabels(titles, fontsize=10)
     ax.set_ylabel("Score")
-    ax.set_title("Benchmark Comparison", fontsize=14, fontweight="bold")
+    ax.set_title("Spatial Alignment Comparison", fontsize=14, fontweight="bold")
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8, frameon=False)
     ax.set_ylim(0, min(ax.get_ylim()[1] + 0.1, 1.05))
     ax.grid(axis="y", alpha=0.3)
@@ -804,11 +779,11 @@ def plot_comparison(df: pd.DataFrame, save_path: Optional[str] = None) -> None:
 
 
 # ============================================================================
-# Generic dataset benchmark (sample_data format)
+# Generic dataset runner (sample_data format)
 # ============================================================================
 
 
-def benchmark_dataset(
+def run_spatial_alignment_dataset(
     dataset: str,
     config: PipelineConfig,
     device: str = "cuda",
@@ -818,8 +793,9 @@ def benchmark_dataset(
     run_gpsa: bool = True,
     run_spateo: bool = True,
     run_stalign: bool = True,
+    run_insta: bool = True,
 ) -> pd.DataFrame:
-    """Run all methods on a single dataset (sample_data format).
+    """Run the spatial alignment experiment on one dataset.
 
     Loads slices from ``{data_dir}/{dataset}/sample_data/``, preprocesses,
     and runs all methods on each consecutive pair.
@@ -827,8 +803,8 @@ def benchmark_dataset(
     Returns:
         DataFrame with all metric columns.
     """
-    from inr_align.config import SLICE_ORDER
-    from inr_align.run import load_slices, preprocess_slices
+    from insta.config import SLICE_ORDER
+    from insta.pipeline import load_slices, preprocess_slices
 
     if dataset not in SLICE_ORDER:
         print(f"  WARNING: {dataset} not in SLICE_ORDER, skipping.")
@@ -854,20 +830,19 @@ def benchmark_dataset(
             print(f"  WARNING: No label column found in {dataset}, skipping.")
             return pd.DataFrame()
 
-    # Wrap as single group for benchmark_all
+    # Wrap as single group for the all-dataset runner.
     layer_groups = [slices]
-    df, *_ = benchmark_all(
+    df, *_ = run_spatial_alignment_all(
         layer_groups, config, device=device,
         label_key=label_key, label_map=None,
         run_paste=run_paste, run_paste2=run_paste2,
         run_gpsa=run_gpsa, run_spateo=run_spateo,
-        run_stalign=run_stalign,
+        run_stalign=run_stalign, run_insta=run_insta,
     )
     # Rename Sample column -> Dataset
     df["Dataset"] = dataset
     df = df.drop(columns=["Sample"])
     return df
-
 
 # ============================================================================
 # Entry point
@@ -878,7 +853,7 @@ def _load_dlpfc_layer_groups(
     data_dir: str = "./Data",
     sample_groups: Optional[List[List[str]]] = None,
 ) -> List[List]:
-    """Load DLPFC original_data for benchmark."""
+    """Load DLPFC original_data for spatial alignment evaluation."""
     if sample_groups is None:
         sample_groups = DLPFC_SAMPLE_GROUPS
 
@@ -910,10 +885,10 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}\n")
 
-    df, *_ = benchmark_all(layer_groups, config, device=device)
+    df, *_ = run_spatial_alignment_all(layer_groups, config, device=device)
     print_summary(df)
-    plot_comparison(df, "benchmark_results.png")
+    plot_comparison(df, "spatial_alignment_results.png")
 
     # Save CSV
-    df.to_csv("benchmark_results.csv", index=False)
-    print("\n\u2705 Results saved to benchmark_results.csv")
+    df.to_csv("spatial_alignment_results.csv", index=False)
+    print("\nResults saved to spatial_alignment_results.csv")

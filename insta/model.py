@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
-from inr_align.config import ICPConfig, JointConfig, MatcherConfig, ModelConfig
+from insta.config import ICPConfig, JointConfig, MatcherConfig, ModelConfig
 
 
 # ============================================================================

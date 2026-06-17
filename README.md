@@ -7,22 +7,23 @@ Spatial transcriptomics slice alignment via implicit neural representations with
 > **MICCAI 2026 Submission**
 
 
-## Package Structure
+## Code Structure
 
 ```
-inr_align/
-  __init__.py             # Public API exports
+insta/
+  __init__.py
   config.py               # All hyperparameters (dataclasses + auto-generated CLI)
-  model.py                # DeformationNet, GeneDecoder, ExprField, UnifiedCostMatcher, adaptive_icp
-  loss.py                 # Matching loss, Jacobian regularization (SVD + divergence), KL loss
-  train.py                # Training loop + inference
-  metrics.py              # OT accuracy, NN accuracy, Ratio, CLC
-  utils.py                # Grid detection, coordinate normalization, griddata resampling
-  run.py                  # End-to-end pipeline (single dataset)
-  benchmark.py            # Multi-method comparison (7 baselines)
-run_test_acc.py           # Benchmark entry point with per-dataset overrides
-benchmark_insta.py        # Quick INSTA-only benchmark with embedding evaluation
-extract_splane_emb.py     # Extract Splane embeddings for clustering evaluation
+  model.py                # DeformationNet, ExprINR, ExprDecoder, UnifiedCostMatcher, adaptive_icp
+  loss.py                 # Spatial-expression matching, Jacobian regularization, reconstruction loss
+  trainer.py              # Training loop + inference
+  metrics.py              # Paper metrics and metric helpers
+  utils.py                # Coordinate, transport-plan, and preprocessing helpers
+  pipeline.py             # Single-dataset INST-Align pipeline
+  spatial_alignment.py    # Shared logic for the spatial alignment experiment
+run_spatial_alignment.py  # Table 1: spatial alignment results
+run_embedding.py          # Table 2: embedding evaluation
+run_ablation_insta.py     # Table 3: INST-Align ablation study
+data/README.md            # Data source and expected layout
 requirements.txt          # Python dependencies
 ```
 
@@ -37,7 +38,7 @@ requirements.txt          # Python dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Install STalign (optional, for benchmark)
+### 2. Install STalign (optional baseline)
 
 ```bash
 pip install git+https://github.com/JEFworks-Lab/STalign.git
@@ -54,18 +55,38 @@ No `setup.py` needed -- run scripts directly from the project root.
 
 ---
 
+## Data
+
+Download the prepared `Data.zip` archive from Zenodo:
+
+```bash
+wget -O Data.zip "https://zenodo.org/records/14906156/files/Data.zip?download=1"
+md5sum Data.zip
+unzip -q Data.zip
+```
+
+Expected checksum:
+
+```text
+ad37e0fac9691d23f9f91eaee28842ed  Data.zip
+```
+
+See `data/README.md` for dataset details and citation.
+
+---
+
 ## Quick Start
 
 ### Run our method on a single dataset
 
 ```bash
-python -m inr_align.run --dataset STARMap
+python -m insta --dataset STARMap
 ```
 
 ### Use as a library
 
 ```python
-from inr_align import PipelineConfig, run
+from insta import PipelineConfig, run
 
 config = PipelineConfig(dataset="STARMap", data_dir="./Data")
 config.train.epochs = 200
@@ -77,37 +98,35 @@ print(metrics_df)
 
 ---
 
-## Benchmark
+## Reproducing Paper Experiments
 
-Compare methods: **No-align**, **PASTE**, **STalign**, **Spateo** (rigid + nonrigid), **INSTA** (rigid + nonrigid).
-
-### Run full benchmark
+### Spatial Alignment Results
 
 ```bash
-# All methods on DLPFC
-python run_test_acc.py --datasets DLPFC
+# Run INST-Align and baselines
+python run_spatial_alignment.py --datasets DLPFC
 
-# INSTA only (skip baselines)
-python run_test_acc.py --datasets DLPFC_sample1 --no_paste --no_spateo --no_stalign
+# Run only INST-Align
+python run_spatial_alignment.py --methods insta --datasets DLPFC_sample1
 
-# All datasets
-python run_test_acc.py --datasets DLPFC STARMap BaristaSeq
+# Run only baselines
+python run_spatial_alignment.py --methods baseline --datasets DLPFC_sample1
 
 # Custom hyperparameters via CLI
-python run_test_acc.py --datasets DLPFC --train_epochs 300 --train_lam_jacobian 0.1
+python run_spatial_alignment.py --datasets DLPFC --train_epochs 300
 ```
 
-### Quick INSTA benchmark with embedding evaluation
+### Embedding Evaluation
 
 ```bash
-python benchmark_insta.py --sample_groups 0
+python run_embedding.py --sample_groups 0 1 2 --run_embryo
 ```
 
-### Output
+### Ablation Study
 
-- `benchmark_results.csv` -- per-pair results
-- `benchmark_summary.csv` -- per-dataset and overall summaries
-- `benchmark_results.png` -- comparison bar chart
+```bash
+python run_ablation_insta.py --dataset DLPFC_sample1
+```
 
 ---
 

@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from inr_align.model import UnifiedCostMatcher
+from insta.model import UnifiedCostMatcher
 
 
 # ============================================================================
@@ -109,34 +109,6 @@ def jacobian_reg(
     log_svals = torch.log(svals)
     weights = torch.where(log_svals < 0, compression_weight, 1.0)
     return (weights * log_svals ** 2).sum(dim=1).mean()
-
-
-# ============================================================================
-# Assignment uniqueness loss
-# ============================================================================
-
-
-def assignment_uniqueness_loss(
-    x2_def: torch.Tensor,
-    x1: torch.Tensor,
-    topk_idx: torch.Tensor,
-    weights: torch.Tensor,
-) -> torch.Tensor:
-    """Penalize multiple source points mapping to the same target.
-
-    Variance of per-target load — high variance = many-to-one collapse.
-    """
-    N1 = x1.shape[0]
-    N2, K = topk_idx.shape
-
-    load = torch.zeros(N1, device=x2_def.device)
-    flat_idx = topk_idx.reshape(-1)
-    flat_w = weights.reshape(-1)
-    load.scatter_add_(0, flat_idx, flat_w)
-
-    ideal_load = float(N2) / float(N1)
-    return (load - ideal_load).pow(2).mean()
-
 
 # ============================================================================
 # Bidirectional matching loss
@@ -278,4 +250,3 @@ def recon_loss_from_emb(
     dice = dice_loss(recon, expr_target)
 
     return mse + l1 + 0.01 * dice
-

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Benchmark INSTA on DLPFC (all sample groups).
+"""Run the paper embedding evaluation (ARI/NMI).
 
 Metrics:
-  Alignment: OT, NN, Ratio, CLC, LISI, Silhouette, Chamfer
-  Embedding: ARI, NMI (on PCA / INR / STAligner / GraphST / SPIRAL embeddings)
+  Embedding: ARI, NMI (PCA / Seurat / STAligner / GraphST / SPIRAL / INR)
 
 Usage:
     conda activate spateo
-    python benchmark_insta.py [--sample_groups 0 1 2]
+    python run_embedding.py [--sample_groups 0 1 2]
 """
 import argparse
 import gc
@@ -38,14 +37,14 @@ warnings.filterwarnings("ignore")
 
 sys.path.insert(0, ".")
 
-from inr_align.benchmark import (
+from insta.spatial_alignment import (
     DLPFC_LABEL_MAP,
     _load_dlpfc_layer_groups,
-    benchmark_all,
     print_summary,
     run_ours,
+    run_spatial_alignment_all,
 )
-from inr_align.config import DLPFC_SAMPLE_GROUPS, PipelineConfig
+from insta.config import DLPFC_SAMPLE_GROUPS, PipelineConfig
 
 
 # ============================================================================
@@ -1007,7 +1006,7 @@ def evaluate_embeddings_dlpfc(slices, slices_raw, sample_ids,
 
 
 def save_embedding_results(df_emb_all, spot_counts, slice_ids,
-                           output_path="benchmark_embedding"):
+                           output_path="embedding_results"):
     """Save embedding results in formatted table.
 
     Args:
@@ -1132,18 +1131,18 @@ def save_embedding_results(df_emb_all, spot_counts, slice_ids,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark INSTA on DLPFC")
+    parser = argparse.ArgumentParser(description="Run embedding evaluation")
     parser.add_argument("--no_paste", action="store_true", default=True)
-    parser.add_argument("--no_paste2", action="store_true", default=False)
-    parser.add_argument("--no_gpsa", action="store_true", default=False)
-    parser.add_argument("--no_spateo", action="store_true", default=False)
+    parser.add_argument("--no_paste2", action="store_true", default=True)
+    parser.add_argument("--no_gpsa", action="store_true", default=True)
+    parser.add_argument("--no_spateo", action="store_true", default=True)
     parser.add_argument("--no_stalign", action="store_true", default=True)
     parser.add_argument("--no_stagate", action="store_true", help="Skip STAGATE embedding")
     parser.add_argument("--no_staligner", action="store_true", help="Skip STAligner embedding")
     parser.add_argument("--no_graphst", action="store_true", help="Skip GraphST embedding")
     parser.add_argument("--no_spiral", action="store_true", help="Skip SPIRAL embedding")
     parser.add_argument("--no_seurat", action="store_true", help="Skip Seurat CCA embedding")
-    parser.add_argument("--no_inr", action="store_true", help="Skip INR training & embedding eval")
+    parser.add_argument("--no_inr", action="store_true", help="Skip INST-Align INR training and embedding eval")
     parser.add_argument("--sample_groups", type=int, nargs="+", default=[0, 1, 2],
                         help="Which DLPFC sample groups to run (0-indexed). Default: all 3")
     parser.add_argument("--dlpfc_pairs", nargs="+", default=None,
@@ -1165,9 +1164,6 @@ def main():
     print(f"Device: {device}")
 
     config = PipelineConfig(data_dir="./Data")
-    config.icp.mode = "icp_only"
-    # DLPFC-specific: lam_jacobian=0.3 (0.1 too weak → collapse; 1.0 too strong)
-    config.joint.lam_jacobian = 0.3
 
     # Parse dlpfc_pairs: selects which slices per group for BOTH Part 1 and Part 2
     # e.g. ["0,1", "0,1", "0,1"] → [[0,1], [0,1], [0,1]]
@@ -1177,7 +1173,7 @@ def main():
         dlpfc_pairs = [[int(x) for x in p.split(",")] for p in args.dlpfc_pairs]
 
     # ================================================================
-    # Part 1: Alignment Benchmark
+    # Part 1: Train INST-Align models used for INR embeddings
     # ================================================================
     sample_indices = args.sample_groups
     inr_models = {}
@@ -1185,9 +1181,11 @@ def main():
     deform_models = {}
     rigid_coords_norm = {}
 
-    if not args.skip_alignment:
+    if args.no_inr:
+        print("\n[Skipping INST-Align INR training: --no_inr]")
+    elif not args.skip_alignment:
         print("\n" + "#" * 70)
-        print("# Part 1: Alignment Benchmark")
+        print("# Part 1: Train INST-Align models for INR embeddings")
         print("#" * 70)
 
         layer_groups = []
@@ -1211,7 +1209,7 @@ def main():
             sample_id_groups.append(group)
             dataset_folders.append(folder)
 
-        df_align, inr_models, norm_params, deform_models, rigid_coords_norm = benchmark_all(
+        df_align, inr_models, norm_params, deform_models, rigid_coords_norm = run_spatial_alignment_all(
             layer_groups, config, device=device,
             label_key="original_domain", label_map=DLPFC_LABEL_MAP,
             run_paste=not args.no_paste,
@@ -1231,8 +1229,8 @@ def main():
         print("=" * 70)
         print_summary(df_align)
 
-        df_align.to_csv("benchmark_alignment.csv", index=False)
-        print(f"\nAlignment results saved to benchmark_alignment.csv")
+        df_align.to_csv("embedding_alignment_cache.csv", index=False)
+        print(f"\nAlignment cache saved to embedding_alignment_cache.csv")
     else:
         print("\n[Skipping Part 1: Alignment]")
 
@@ -1372,9 +1370,9 @@ def main():
         embryo_rigid_coords_list = [None]
         if not args.no_inr:
             print("  Training INR on MouseEmbryo...")
-            # Use adaptive ICP for embryo (may have rotation)
+            # Use PCA-based ICP for embryo (may have rotation)
             saved_icp_mode = config.icp.mode
-            config.icp.mode = "adaptive"
+            config.icp.mode = "pca"
             try:
                 _, _, _t_inr, embryo_expr_inr, embryo_norm_ms, embryo_deform, embryo_rigid_coords = run_ours(
                     embryo_raw[0].copy(), embryo_raw[1].copy(),

@@ -26,15 +26,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from inr_align.config import JointConfig, TrainConfig
-from inr_align.loss import (
-    assignment_uniqueness_loss,
+from insta.config import JointConfig, TrainConfig
+from insta.loss import (
     compute_P_matrix,
     jacobian_reg,
     matching_loss_joint,
     recon_loss_from_emb,
 )
-from inr_align.model import (
+from insta.model import (
     DeformationNet,
     ExprDecoder,
     ExprINR,
@@ -263,6 +262,7 @@ def train(
                 "epoch": -(jcfg.inr_pretrain_epochs - ep),
                 "phase": 1, "recon": recon_val, "match": match_val,
                 "loss": recon_val + match_val, "tau": matcher.tau,
+                "s_sp": matcher.spatial_scale, "s_ft": matcher.feat_scale,
                 "lr": jcfg.inr_pretrain_lr,
             })
 
@@ -351,7 +351,6 @@ def train(
         ep_match = 0.0
         ep_recon = 0.0
         ep_jac = 0.0
-        ep_uniq = 0.0
         ep_total = 0.0
         n_batch = 0
 
@@ -368,8 +367,10 @@ def train(
             # --- P-matrix features ---
             if use_inr:
                 # x2_def is in s1's canonical space → use ExprINR_s1
-                # Detach: embedding is a fixed soft mask for P-matrix, not a gradient path
-                emb2_for_match = F.normalize(expr_inr_s1(x2_def.detach(), alpha_inr_t), dim=1)
+                # no_grad: embedding is a fixed soft prior for P-matrix,
+                # matching loss must NOT update INR parameters (prevents collapse)
+                with torch.no_grad():
+                    emb2_for_match = F.normalize(expr_inr_s1(x2_def.detach(), alpha_inr_t), dim=1)
             else:
                 emb2_for_match = emb2_pca_norm[idx]
 
@@ -379,17 +380,12 @@ def train(
                 matcher, config.topk, config.weight_rev,
             )
 
-            # --- 2. Assignment uniqueness loss ---
-            L_uniq = torch.tensor(0.0, device=device)
-            if jcfg.lam_uniqueness > 0:
-                L_uniq = assignment_uniqueness_loss(x2_def, x1, fwd_idx, fwd_w)
-
-            # --- 3. Jacobian reg (spatial head only) ---
+            # --- 2. Jacobian reg (spatial head only) ---
             L_jac = torch.tensor(0.0, device=device)
             if jcfg.lam_jacobian > 0:
                 L_jac = jacobian_reg(deform, x2_batch, alpha_t)
 
-            # --- 4. Deformation magnitude penalty ---
+            # --- 3. Deformation magnitude penalty ---
             L_deform_mag = torch.tensor(0.0, device=device)
             if jcfg.lam_deform_mag > 0:
                 displacement = x2_def - x2[idx]
@@ -415,7 +411,6 @@ def train(
 
             # --- Total loss ---
             loss = (jcfg.lam_match * L_match
-                    + jcfg.lam_uniqueness * L_uniq
                     + jcfg.lam_jacobian * L_jac
                     + jcfg.lam_deform_mag * L_deform_mag
                     + jcfg.lam_recon_phase2 * L_recon)
@@ -431,7 +426,6 @@ def train(
             ep_match += L_match.item()
             ep_recon += L_recon.item()
             ep_jac += L_jac.item()
-            ep_uniq += L_uniq.item()
             ep_total += loss.item()
             n_batch += 1
 
@@ -443,7 +437,8 @@ def train(
 
             if use_inr:
                 # x2_def_all in canonical space → ExprINR_s1
-                emb2_fc = F.normalize(expr_inr_s1(x2_def_all.detach(), alpha_inr_t), dim=1)
+                with torch.no_grad():
+                    emb2_fc = F.normalize(expr_inr_s1(x2_def_all.detach(), alpha_inr_t), dim=1)
             else:
                 emb2_fc = emb2_pca_norm
 
@@ -459,10 +454,9 @@ def train(
                 nn.utils.clip_grad_norm_(deform.parameters(), config.grad_clip)
             optimizer.step()
 
-        # --- Best checkpoint (match + uniqueness penalty) ---
+        # --- Best checkpoint (match loss) ---
         avg_match = ep_match / max(n_batch, 1)
-        avg_uniq = ep_uniq / max(n_batch, 1)
-        avg_score = avg_match + jcfg.lam_uniqueness * avg_uniq
+        avg_score = avg_match
         if avg_score < best_match:
             best_match = avg_score
             best_states = {
@@ -479,6 +473,7 @@ def train(
         record = {
             "epoch": ep, "loss": ep_total / max(n_batch, 1),
             "match": avg_match, "tau": matcher.tau, "lr": cur_lr,
+            "s_sp": matcher.spatial_scale, "s_ft": matcher.feat_scale,
             "recon": ep_recon / max(n_batch, 1),
             "jac": ep_jac / max(n_batch, 1),
             "phase": 2,
