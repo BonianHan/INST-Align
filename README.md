@@ -4,7 +4,7 @@
 
 Spatial transcriptomics slice alignment via implicit neural representations with multi-task learning.
 
-> **MICCAI 2026 Submission**
+> **MICCAI 2026 Accepted**
 
 
 ## Code Structure
