@@ -1,6 +1,6 @@
 # INST-Align
 
-**Implicit Neural Spatial Transcriptomics Alignment**
+**[Implicit Neural Spatial Transcriptomics Alignment](https://arxiv.org/pdf/2604.12084)**
 
 Spatial transcriptomics slice alignment via implicit neural representations with multi-task learning.
 
