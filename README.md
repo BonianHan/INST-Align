@@ -102,6 +102,7 @@ print(metrics_df)
 ### Visualization example
 
 ```bash
+pip install notebook  # if Jupyter is not already installed
 jupyter notebook examples/visualization.ipynb
 ```
 
