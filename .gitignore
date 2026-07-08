@@ -36,7 +36,9 @@ build/
 
 # Jupyter notebooks
 *.ipynb
+!examples/*.ipynb
 .ipynb_checkpoints/
+examples/outputs/
 
 # LaTeX build artifacts
 *.aux

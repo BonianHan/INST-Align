@@ -20,6 +20,9 @@ insta/
   utils.py                # Coordinate, transport-plan, and preprocessing helpers
   pipeline.py             # Single-dataset INST-Align pipeline
   spatial_alignment.py    # Shared logic for the spatial alignment experiment
+  visualization.py        # 2D overlay and 3D stack visualization helpers
+examples/
+  visualization.ipynb     # Public visualization example
 run_spatial_alignment.py  # Table 1: spatial alignment results
 run_embedding.py          # Table 2: embedding evaluation
 run_ablation_insta.py     # Table 3: INST-Align ablation study
@@ -95,6 +98,15 @@ config.train.lam_jacobian = 0.01
 aligned_slices, metrics_df = run(config)
 print(metrics_df)
 ```
+
+### Visualization example
+
+```bash
+jupyter notebook examples/visualization.ipynb
+```
+
+The notebook runs a small STARMap pairwise alignment, saves before/after
+alignment overlays, and shows the same aligned slices as a stacked 3D view.
 
 ---
 
