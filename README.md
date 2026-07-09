@@ -21,8 +21,8 @@ insta/
   pipeline.py             # Single-dataset INST-Align pipeline
   spatial_alignment.py    # Shared logic for the spatial alignment experiment
   visualization.py        # 2D overlay and 3D stack visualization helpers
-examples/
-  visualization.ipynb     # Public visualization example
+visualization.ipynb       # Visualization notebook
+assets/                   # Notebook outputs and visual assets
 run_spatial_alignment.py  # Table 1: spatial alignment results
 run_embedding.py          # Table 2: embedding evaluation
 run_ablation_insta.py     # Table 3: INST-Align ablation study
@@ -103,11 +103,11 @@ print(metrics_df)
 
 ```bash
 pip install notebook  # if Jupyter is not already installed
-jupyter notebook examples/visualization.ipynb
+jupyter notebook visualization.ipynb
 ```
 
-The notebook runs a small STARMap pairwise alignment, saves before/after
-alignment overlays, and shows the same aligned slices as a stacked 3D view.
+The notebook reproduces the paper qualitative visualizations: MouseEmbryo
+alignment and DLPFC Sample 3 3D reconstruction.
 
 ---
 

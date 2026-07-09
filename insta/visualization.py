@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -38,7 +38,27 @@ def _coords(adata, spatial_key: str) -> np.ndarray:
     return np.asarray(adata.obsm[spatial_key], dtype=np.float64)
 
 
-def _save(fig, save_path: Optional[os.PathLike | str], dpi: int, tight: bool = True) -> None:
+PathLike = Union[os.PathLike, str]
+
+
+MOUSE_EMBRYO_OVERRIDES = {
+    "epochs": 500,
+    "batch_size": 4000,
+    "lr": 3e-4,
+    "grad_clip": 2.0,
+    "lam_jacobian": 0.01,
+    "lam_deform_mag": 0.0,
+    "tau_min": 0.005,
+    "mode": "pca",
+    "inr_pretrain_epochs": 150,
+    "freeze_inr_phase2": True,
+    "lam_recon_phase2": 0.0,
+    "warmup_fraction": 0.0,
+    "scheduler_patience": 9999,
+}
+
+
+def _save(fig, save_path: Optional[PathLike], dpi: int, tight: bool = True) -> None:
     if save_path is None:
         return
     path = Path(save_path)
@@ -52,6 +72,32 @@ def center_translate(ref_coords: np.ndarray, src_coords: np.ndarray) -> np.ndarr
     ref = np.asarray(ref_coords, dtype=np.float64)
     src = np.asarray(src_coords, dtype=np.float64)
     return src + (ref.mean(axis=0) - src.mean(axis=0))
+
+
+def _apply_overrides(config, overrides: Mapping[str, object]) -> None:
+    for name, value in overrides.items():
+        if hasattr(config.train, name):
+            setattr(config.train, name, value)
+        elif hasattr(config.joint, name):
+            setattr(config.joint, name, value)
+        elif hasattr(config.matcher, name):
+            setattr(config.matcher, name, value)
+        elif hasattr(config.icp, name):
+            setattr(config.icp, name, value)
+
+
+def _preprocess_figure_slices(slices: Sequence, n_top_genes: int = 2000) -> None:
+    import scanpy as sc
+    import spateo as st
+
+    for adata in slices:
+        if "counts" not in adata.layers:
+            adata.layers["counts"] = adata.X.copy()
+        sc.pp.normalize_total(adata)
+        sc.pp.log1p(adata)
+        if "highly_variable" not in adata.var.columns:
+            sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes)
+    st.align.group_pca(list(slices), pca_key="X_pca")
 
 
 def _normalize_pair(
@@ -119,7 +165,7 @@ def plot_before_after(
     aligned_spatial_key: str = "spatial_aligned",
     ref_label: str = "Slice 1",
     src_label: str = "Slice 2",
-    save_path: Optional[os.PathLike | str] = None,
+    save_path: Optional[PathLike] = None,
     show: bool = True,
     dpi: int = 300,
 ) -> Tuple[plt.Figure, Sequence[plt.Axes]]:
@@ -186,7 +232,7 @@ def plot_3d_stack(
     elev: float = 30,
     azim: float = -55,
     point_size: float = 16,
-    save_path: Optional[os.PathLike | str] = None,
+    save_path: Optional[PathLike] = None,
     show: bool = True,
     dpi: int = 300,
 ) -> Tuple[plt.Figure, plt.Axes]:
@@ -264,3 +310,266 @@ def plot_3d_stack(
     else:
         plt.close(fig)
     return fig, ax
+
+
+def plot_mouseembryo_alignment(
+    ref_coords: np.ndarray,
+    center_translated_coords: np.ndarray,
+    aligned_coords: np.ndarray,
+    save_path: Optional[PathLike] = None,
+    show: bool = True,
+    dpi: int = 600,
+) -> Tuple[plt.Figure, Sequence[plt.Axes]]:
+    """Plot the MouseEmbryo qualitative panels used in the paper."""
+    color_s1 = "#CC0000"
+    color_s2 = "#0044CC"
+
+    fig, axes = plt.subplots(1, 2, figsize=(22, 11), facecolor="white")
+    panels = [
+        (axes[0], ref_coords, center_translated_coords, "(a)"),
+        (axes[1], ref_coords, aligned_coords, "(b)"),
+    ]
+
+    for ax, ref, query, label in panels:
+        ref = np.asarray(ref, dtype=np.float64)
+        query = np.asarray(query, dtype=np.float64)
+        all_coords = np.vstack([ref, query])
+        cmin, cmax = all_coords.min(axis=0), all_coords.max(axis=0)
+        span = float((cmax - cmin).max()) * 1.08
+        if span == 0:
+            span = 1.0
+        center = (cmin + cmax) / 2.0
+
+        ref_plot = (ref - center) / span + 0.5
+        query_plot = (query - center) / span + 0.5
+
+        ax.scatter(
+            query_plot[:, 0], query_plot[:, 1],
+            s=3, c=color_s2, alpha=0.8, edgecolors="none", rasterized=True,
+        )
+        ax.scatter(
+            ref_plot[:, 0], ref_plot[:, 1],
+            s=3, c=color_s1, alpha=0.8, edgecolors="none", rasterized=True,
+        )
+
+        ax.set_xlim(-0.02, 1.02)
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.text(
+            0.5, -0.06, label,
+            transform=ax.transAxes, fontsize=36, fontweight="bold",
+            ha="center", va="top",
+        )
+
+    legend_elements = [
+        Line2D([], [], marker="o", color="w", markerfacecolor=color_s1,
+               markersize=28, label="Slice 1", linestyle="None"),
+        Line2D([], [], marker="o", color="w", markerfacecolor=color_s2,
+               markersize=28, label="Slice 2", linestyle="None"),
+    ]
+    fig.legend(
+        handles=legend_elements, loc="lower center", bbox_to_anchor=(0.5, 0.01),
+        ncol=2, frameon=False, fontsize=32, handletextpad=0.6, columnspacing=3.0,
+    )
+    plt.subplots_adjust(wspace=0.04, bottom=0.08)
+    _save(fig, save_path, dpi)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, axes
+
+
+def make_mouseembryo_figure(
+    data_dir: str = "Data",
+    save_dir: str = "assets",
+    device: Optional[str] = None,
+    save_name: str = "mouseembryo_figure.png",
+    show: bool = True,
+    epochs: Optional[int] = None,
+    pretrain_epochs: Optional[int] = None,
+) -> Tuple[plt.Figure, Sequence[plt.Axes]]:
+    """Run INST-Align on MouseEmbryo and draw paper panels (a) and (b)."""
+    import scanpy as sc
+    import torch
+
+    from insta.config import PipelineConfig
+    from insta.pipeline import align_pair
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    sample_dir = os.path.join(data_dir, "MouseEmbryo", "sample_data")
+    s1 = sc.read_h5ad(os.path.join(sample_dir, "slices1.h5ad"))
+    s2 = sc.read_h5ad(os.path.join(sample_dir, "slices2.h5ad"))
+    print(f"Loaded MouseEmbryo: slices1 ({s1.n_obs}) + slices2 ({s2.n_obs})")
+
+    _preprocess_figure_slices([s1, s2])
+
+    config = PipelineConfig(dataset="MouseEmbryo", data_dir=data_dir)
+    _apply_overrides(config, MOUSE_EMBRYO_OVERRIDES)
+    config.icp.icp_threshold = -1.0
+    if epochs is not None:
+        config.train.epochs = epochs
+    if pretrain_epochs is not None:
+        config.joint.inr_pretrain_epochs = pretrain_epochs
+
+    coords1 = s1.obsm["spatial"].copy()
+    coords2 = s2.obsm["spatial"].copy()
+    coords2_center = center_translate(coords1, coords2)
+
+    aligned_coords, _ = align_pair(s1, s2, config, device)
+
+    save_path = os.path.join(save_dir, save_name)
+    return plot_mouseembryo_alignment(
+        coords1, coords2_center, aligned_coords,
+        save_path=save_path, show=show,
+    )
+
+
+def align_dlpfc_sample3_consecutive(
+    data_dir: str = "Data",
+    device: Optional[str] = None,
+    epochs: Optional[int] = None,
+    pretrain_epochs: Optional[int] = None,
+):
+    """Align DLPFC Sample 3 consecutive slices for the paper 3D figure."""
+    import scanpy as sc
+    import torch
+
+    from insta.config import DLPFC_SAMPLE_GROUPS, PipelineConfig
+    from insta.pipeline import align_pair
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    sample_idx = 2
+    group = DLPFC_SAMPLE_GROUPS[sample_idx]
+    folder = f"DLPFC_sample{sample_idx + 1}"
+
+    slices = []
+    for sid in group:
+        path = os.path.join(data_dir, folder, "original_data", f"{sid}.h5ad")
+        adata = sc.read_h5ad(path)
+        print(f"Loaded {sid}: {adata.shape}")
+        slices.append(adata)
+
+    _preprocess_figure_slices(slices)
+
+    config = PipelineConfig(dataset="DLPFC_sample3", data_dir=data_dir)
+    config.icp.icp_threshold = -1.0
+    if epochs is not None:
+        config.train.epochs = epochs
+    if pretrain_epochs is not None:
+        config.joint.inr_pretrain_epochs = pretrain_epochs
+
+    aligned = [slices[0].copy()]
+    aligned[0].obsm["spatial_aligned"] = slices[0].obsm["spatial"].copy()
+
+    for i in range(len(slices) - 1):
+        print(f"\nAligning {group[i + 1]} -> {group[i]}")
+        coords_aligned, result = align_pair(slices[i], slices[i + 1], config, device)
+        adata = slices[i + 1].copy()
+        adata.obsm["spatial_aligned"] = coords_aligned
+        aligned.append(adata)
+        if result is not None:
+            print(f"  Done ({result.training_time:.1f}s)")
+
+    return aligned
+
+
+def plot_dlpfc3_3d(
+    slices: Sequence,
+    label_key: str = "original_domain",
+    spatial_key: str = "spatial_aligned",
+    save_path: Optional[PathLike] = None,
+    elev: float = 30,
+    azim: float = -55,
+    show: bool = True,
+    dpi: int = 600,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """Plot the DLPFC Sample 3 3D reconstruction used as panel (c)."""
+    all_coords = np.vstack([adata.obsm[spatial_key] for adata in slices])
+    global_mean = all_coords.mean(axis=0)
+
+    fig = plt.figure(figsize=(14, 16), facecolor="white")
+    ax = fig.add_axes([0.02, 0.08, 0.96, 0.90], projection="3d")
+    ax.view_init(elev=elev, azim=azim)
+
+    z_spacing = 1.5
+    for i in range(len(slices) - 1, -1, -1):
+        adata = slices[i]
+        coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64) - global_mean
+        labels = np.asarray(adata.obs[label_key]).astype(str)
+        z = np.full(len(coords), i * z_spacing)
+
+        for layer in DLPFC_LAYER_ORDER:
+            mask = labels == layer
+            if not np.any(mask):
+                continue
+            ax.scatter(
+                coords[mask, 0], coords[mask, 1], z[mask],
+                c=DLPFC_LAYER_COLORS[layer], s=35, alpha=1.0,
+                edgecolors="none", depthshade=True, rasterized=True,
+            )
+
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    ax.xaxis.line.set_visible(False)
+    ax.yaxis.line.set_visible(False)
+    ax.zaxis.line.set_visible(False)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_zticks([])
+    ax.xaxis.pane.set_edgecolor("white")
+    ax.yaxis.pane.set_edgecolor("white")
+    ax.zaxis.pane.set_edgecolor("white")
+    ax.grid(False)
+
+    legend_elements = [
+        Line2D([], [], marker="o", color="w",
+               markerfacecolor=DLPFC_LAYER_COLORS[layer],
+               markersize=32, label=layer, linestyle="None")
+        for layer in DLPFC_LAYER_ORDER
+    ]
+    legend = ax.legend(
+        handles=legend_elements, loc="upper right", ncol=1, frameon=True,
+        fontsize=32, handletextpad=0.4, labelspacing=0.5, fancybox=True,
+        framealpha=0.9, edgecolor="lightgray",
+    )
+    legend.get_frame().set_linewidth(0.5)
+    fig.text(0.5, 0.02, "(c)", fontsize=36, fontweight="bold",
+             ha="center", va="bottom")
+
+    _save(fig, save_path, dpi, tight=False)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, ax
+
+
+def make_dlpfc3_figure(
+    data_dir: str = "Data",
+    save_dir: str = "assets",
+    device: Optional[str] = None,
+    save_name: str = "dlpfc3_3d.png",
+    show: bool = True,
+    epochs: Optional[int] = None,
+    pretrain_epochs: Optional[int] = None,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """Run consecutive DLPFC Sample 3 alignment and draw paper panel (c)."""
+    aligned = align_dlpfc_sample3_consecutive(
+        data_dir=data_dir, device=device,
+        epochs=epochs, pretrain_epochs=pretrain_epochs,
+    )
+    return plot_dlpfc3_3d(
+        aligned,
+        save_path=os.path.join(save_dir, save_name),
+        show=show,
+    )
