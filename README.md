@@ -23,6 +23,7 @@ insta/
   visualization.py        # 2D overlay and 3D stack visualization helpers
 visualization.ipynb       # Visualization notebook
 assets/                   # Notebook outputs and visual assets
+run_insta.py              # Quick start: run INST-Align only
 run_spatial_alignment.py  # Table 1: spatial alignment results
 run_embedding.py          # Table 2: embedding evaluation
 run_ablation_insta.py     # Table 3: INST-Align ablation study
